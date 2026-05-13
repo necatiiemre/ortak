@@ -243,20 +243,31 @@ static void build_eth_ptp(uint8_t      *dst,
 }
 
 /* Build a Sync frame carrying T1 (our TX time) in originTimestamp.
- * Master role only: ATE → VMC on f->sync_vl_id at 1 Hz. */
+ * Master role only: ATE → VMC on f->sync_vl_id at 1 Hz. The wire layout
+ * mirrors the peer master byte-for-byte: messageLength = 106 with a 72-byte
+ * body (10B originTimestamp + 62B zero padding) — see PTP_SYNC_PADDED_LEN. */
 static void build_sync(uint8_t *dst,
                        const struct ptp_flow *f,
                        uint16_t sequence_id,
                        uint64_t t1_ns)
 {
-    struct ptp_msg_sync body;
-    memset(&body, 0, sizeof(body));
-    fill_ptp_header(&body.hdr, PTP_MSG_SYNC,
-                    PTP_SYNC_LEN, /* domain */ 10,
-                    sequence_id, /* control */ 0x00, f->ne);
-    ptp_ns_to_ts(t1_ns, &body.origin_ts);
+    uint8_t body[PTP_SYNC_PADDED_LEN];
+    memset(body, 0, sizeof(body));
 
-    build_eth_ptp(dst, f->ne, f->sync_vlan, f->sync_vl_id, &body, PTP_SYNC_LEN);
+    fill_ptp_header((struct ptp_header *)body,
+                    PTP_MSG_SYNC,
+                    PTP_SYNC_PADDED_LEN, /* messageLength = 106 */
+                    /* domain  */ 10,
+                    sequence_id,
+                    /* control */ 0x00,
+                    f->ne);
+
+    ptp_ns_to_ts(t1_ns,
+                 (struct ptp_timestamp *)(body + PTP_HDR_LEN));
+    /* Remaining 62 bytes already zero from memset. */
+
+    build_eth_ptp(dst, f->ne, f->sync_vlan, f->sync_vl_id,
+                  body, sizeof(body));
 }
 
 /* Build a Delay_Resp frame echoing T3 as receiveTimestamp.
@@ -569,7 +580,7 @@ static void *ptp_thread_fn(void *arg)
                 mono - st->last_sync_tx_mono_ns < 1000000000ULL) continue;
 
             uint64_t t1 = now_real_ns();
-            uint8_t  buf[sizeof(struct ptp_eth_frame) + PTP_SYNC_LEN];
+            uint8_t  buf[sizeof(struct ptp_eth_frame) + PTP_SYNC_PADDED_LEN];
             build_sync(buf, f, ++st->tx_seq, t1);
             if (ptp_tx_frame(f->dpdk_port, buf, sizeof(buf)) == 0) {
                 st->sync_tx++;

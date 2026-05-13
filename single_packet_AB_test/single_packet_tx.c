@@ -59,16 +59,16 @@
 /* PTPv2 ortak header + Sync gövde sabitleri (ptp_wire.h ile ayni) */
 #define PTP_VERSION        0x02
 #define PTP_MSG_SYNC       0x00
-#define PTP_HDR_LEN        34
-#define PTP_SYNC_LEN       (PTP_HDR_LEN + 10)   /* 44 */
-#define PTP_DOMAIN         10
-#define PTP_FLAGS          0x0102               /* alternateMaster | leap59 — peer master uyumu */
-#define PTP_CONTROL_SYNC   0x00
-#define PTP_LOG_MSG_INT    0x00                 /* 1 Hz Sync → 2^0 = 1 s */
+#define PTP_HDR_LEN          34
+#define PTP_SYNC_PADDED_LEN  106                  /* peer master byte-for-byte: hdr(34)+ts(10)+pad(62) */
+#define PTP_DOMAIN           10
+#define PTP_FLAGS            0x0102               /* alternateMaster | leap59 — peer master uyumu */
+#define PTP_CONTROL_SYNC     0x00
+#define PTP_LOG_MSG_INT      0x00                 /* 1 Hz Sync → 2^0 = 1 s */
 
-#define ETH_HDR_LEN        14
-#define VLAN_HDR_LEN       4
-#define PACKET_SIZE        (ETH_HDR_LEN + VLAN_HDR_LEN + PTP_SYNC_LEN)  /* 62 */
+#define ETH_HDR_LEN          14
+#define VLAN_HDR_LEN         4
+#define PACKET_SIZE          (ETH_HDR_LEN + VLAN_HDR_LEN + PTP_SYNC_PADDED_LEN)  /* 124 */
 
 /* ========================================== */
 /* PTP TIMESTAMP                               */
@@ -130,8 +130,8 @@ static void build_packet(uint8_t *pkt,
     uint8_t *p = pkt + 18;
     p[0]  = PTP_MSG_SYNC & 0x0F;          /* transportSpecific=0 | msgType=Sync */
     p[1]  = PTP_VERSION;                  /* reserved=0 | ver=2 */
-    p[2]  = (PTP_SYNC_LEN >> 8) & 0xFF;   /* messageLength BE */
-    p[3]  =  PTP_SYNC_LEN       & 0xFF;
+    p[2]  = (PTP_SYNC_PADDED_LEN >> 8) & 0xFF;   /* messageLength BE = 106 */
+    p[3]  =  PTP_SYNC_PADDED_LEN       & 0xFF;
     p[4]  = PTP_DOMAIN;
     p[5]  = 0;                            /* reserved */
     p[6]  = (PTP_FLAGS >> 8) & 0xFF;      /* flagField BE */

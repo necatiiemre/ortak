@@ -22,6 +22,13 @@
 #define PTP_DELAY_REQ_LEN      (PTP_HDR_LEN + 10)               /* 44 */
 #define PTP_DELAY_RESP_LEN     (PTP_HDR_LEN + 10 + 10)          /* 54 */
 
+/* The peer master emits Sync with messageLength=106 (header + 10B
+ * originTimestamp + 62B zero padding) on a 124-byte wire frame. Mirror this
+ * exact size on TX so M1 slaves that strict-check the frame shape accept
+ * our Sync. Delay_Req / Delay_Resp keep the spec-defined sizes — those
+ * are already accepted by the peer. */
+#define PTP_SYNC_PADDED_LEN    106
+
 /* PTPv2 timestamp = 6-byte seconds (big-endian) + 4-byte nanoseconds (BE) */
 struct ptp_timestamp {
     uint8_t  sec_hi;       /* seconds[47..40] */
