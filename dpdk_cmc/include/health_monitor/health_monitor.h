@@ -3,76 +3,115 @@
 
 #include <stdint.h>
 #include <stdbool.h>
-#include <cmc_message_types.h>
+#include <stddef.h>
 
-// NOT: Health Monitor trafiği ayrı bir interface değil, normal DPDK data-plane
-// port'ları üzerinden taşınır. Tüm HM paketleri (CPU usage, CBIT, PBIT) DUT
-// tarafından otonom olarak yollanır; rx_worker fast-path'inde VL-ID aralığı
-// kontrolüyle hm_handle_packet()'e düşer.
+#include <cmc_es_monitoring.h>   // tA664ESMonitoring
+#include <cmc_sw_monitoring.h>   // tA664SWMonitoring (status + port[12])
+#include <cmc_other_types.h>     // Pcs_profile_stats, COUNTERS
 
 // ============================================================================
-// VL-ID tanımları
+// CMC Health Monitor
+// ----------------------------------------------------------------------------
+// HM trafiği ayrı bir interface değil; normal DPDK data-plane portları üzerinde
+// taşınır. rx_worker fast-path'inde VL-ID set kontrolü ile yakalanıp
+// hm_handle_packet()'e düşer. PRBS doğrulama yolundan çıkar.
+//
+// VL-ID'ler iki bloğa ayrılır:
+//   * 2021, 2042, 2063, 2084, 2105 → ES_MON / PCS / COUNTERS paketleri
+//   * 8009, 8109                   → ES_MON / PCS / COUNTERS + ek olarak SW_MON
+//
+// Aynı VL-ID üzerinden farklı struct'lar farklı paketlerde gelir; tür ayrımı
+// payload uzunluğuna göre yapılır.
 // ============================================================================
-#define HEALTH_MONITOR_FLCS_CPU_USAGE_VLID      0x0009
-#define HEALTH_MONITOR_VS_CPU_USAGE_VLID        0x0010
 
-#define HEALTH_MONITOR_FLCS_PBIT_REQUEST_VLID   0x000c
-#define HEALTH_MONITOR_VS_PBIT_REQUEST_VLID     0x000f
+// HM VL-ID set (rx_worker erken-dallanması için)
+#define HM_VLID_2021   2021
+#define HM_VLID_2042   2042
+#define HM_VLID_2063   2063
+#define HM_VLID_2084   2084
+#define HM_VLID_2105   2105
+#define HM_VLID_8009   8009
+#define HM_VLID_8109   8109
 
-#define HEALTH_MONITOR_FLCS_PBIT_RESPONSE_VLID  0x000a
-#define HEALTH_MONITOR_VS_PBIT_RESPONSE_VLID    0x000d
-
-#define HEALTH_MONITOR_FLCS_CBIT_VLID           0x000b
-#define HEALTH_MONITOR_VS_CBIT_VLID             0x000e
-
-// HM VL-ID aralığı (rx_worker erken-dallanmasında aralık kontrolü için).
-// Bu aralığa düşen paketler PRBS doğrulamasına girmez.
-#define HM_VL_ID_MIN 0x0009
-#define HM_VL_ID_MAX 0x0010
-
-// CBIT paketleri içindeki vmp_cmsw_header_t.message_identifier değerleri.
-// (VL-ID 11 / 14 aynı anda 4 farklı struct taşıyabiliyor; ayrım msg_id ile.)
-#define HM_CBIT_MSG_ID_DTN_ES         2
-#define HM_CBIT_MSG_ID_DTN_SW         3
-#define HM_CBIT_MSG_ID_BM_ENGINEERING 5
-#define HM_CBIT_MSG_ID_BM_FLAG        6
-
-// PBIT response paketleri (VL-ID 0x0a/0x0d) içindeki msg_id. Range check
-// (0x0009-0x0010) tek başına yetmez; aynı VL-ID'ye farklı trafik gelebildiği
-// için hm_handle_packet içinde msg_id doğrulaması yapılır.
-#define HM_PBIT_RESPONSE_MSG_ID       100
-
+// True ⇒ paket HM dispatch'ine girer (PRBS path'inden çıkar).
 static inline bool hm_is_health_monitor_vl_id(uint16_t vl_id)
 {
-    return (vl_id >= HM_VL_ID_MIN && vl_id <= HM_VL_ID_MAX);
+    switch (vl_id) {
+        case HM_VLID_2021:
+        case HM_VLID_2042:
+        case HM_VLID_2063:
+        case HM_VLID_2084:
+        case HM_VLID_2105:
+        case HM_VLID_8009:
+        case HM_VLID_8109:
+            return true;
+        default:
+            return false;
+    }
 }
 
-// Dashboard basım aralığı (ms)
+// SW_MON sadece 8009 ve 8109'dan beklenir.
+static inline bool hm_vl_id_accepts_sw_mon(uint16_t vl_id)
+{
+    return (vl_id == HM_VLID_8009 || vl_id == HM_VLID_8109);
+}
+
+// Dashboard basım aralığı (ms). Main loop sleep(1) ile uyumlu.
 #define HEALTH_MONITOR_DASHBOARD_INTERVAL_MS 1000
 
 // ============================================================================
-// RX fast-path entry point: rx_worker içinden çağrılır.
-// payload  = UDP payload başı
-// len      = UDP payload uzunluğu (>= beklenen struct boyutu olmalı)
+// Queue item — tagged union. RX worker doldurur, dashboard tüketir.
+// ============================================================================
+typedef enum {
+    HM_ITEM_NONE = 0,
+    HM_ITEM_PCS_PROFILE,        // Pcs_profile_stats
+    HM_ITEM_COUNTERS_DPM,       // COUNTERS_DPM
+    HM_ITEM_COUNTERS_DSM,       // COUNTERS_DSM
+    HM_ITEM_DTN_ES_MONITORING,  // tA664ESMonitoring
+    HM_ITEM_DTN_SW_MONITORING,  // tA664SWMonitoring
+} hm_item_kind_t;
+
+typedef struct {
+    hm_item_kind_t kind;
+    uint16_t       vl_id;
+    uint64_t       rx_timestamp_ns;
+    union {
+        Pcs_profile_stats   pcs;
+        COUNTERS_DPM        counters_dpm;
+        COUNTERS_DSM        counters_dsm;
+        tA664ESMonitoring   es_mon;
+        tA664SWMonitoring   sw_mon;   // status + port[12]
+    } payload;
+} hm_queue_item_t;
+
+// Ring kapasitesi. ~200 pps'lik HM yükü için fazlasıyla yeterli.
+#define HM_RING_CAPACITY 256
+
+// ============================================================================
+// RX fast-path entry — rx_worker'dan çağrılır.
+//   vl_id    : pakette extract edilmiş VL-ID
+//   payload  : UDP payload başı
+//   len      : UDP payload uzunluğu (bayt)
+// Tür payload uzunluğuna göre belirlenir; bilinmeyen uzunluk → drop + sayaç.
 // ============================================================================
 void hm_handle_packet(uint16_t vl_id, const uint8_t *payload, uint16_t len);
 
 // ============================================================================
-// Dashboard — main thread içinden çağrılır.
-// hm_print_dashboard() her çağrıldığında şu anki en güncel snapshot'ı basar
-// (tüm HM slot'larını sırayla). Stats tablosundan sonra çağrılarak sıralı
-// çıktı elde edilir.
+// Dashboard — main thread'den 1 Hz çağrılır. Ring'i drain eder, her item için
+// uygun print_* fonksiyonunu çağırır, sonunda tick + diag sayaç satırı basar.
 // ============================================================================
 void hm_print_dashboard(void);
 
 // ============================================================================
-// Print fonksiyonları (printer thread ya da debug amaçlı dışarıdan çağrılır)
+// Print fonksiyonları — health_monitor_cmc.c içinde.
+// vl_id: paketin geldiği VL-ID, başlıkta gösterilir.
+// packets: bu tick'te aynı (vl_id, kind) çiftinden kaç paket dedup edildi
+//          (başlıkta "×N" notu olarak görünür). 1 ise not yazılmaz.
 // ============================================================================
-void print_cmc_pbit_report     (const cmc_pbit_data_t *data,           const char *device_name);
-void print_bm_cbit_report      (const bm_engineering_cbit_report_t *data, const char *report_title, const char *device_name);
-void print_bm_flag_cbit_report (const bm_flag_cbit_report_t *data,     const char *device_name);
-void print_dtn_es_cbit_report  (const dtn_es_cbit_report_t *data,      const char *device_name);
-void print_dtn_sw_cbit_report  (const dtn_sw_cbit_report_t *data,      const char *device_name);
-void print_pcs_profile_stats   (const Pcs_profile_stats *data,         const char *device_name);
+void print_pcs_profile_stats   (const Pcs_profile_stats   *data, uint16_t vl_id, unsigned packets);
+void print_counters_dpm        (const COUNTERS_DPM        *data, uint16_t vl_id, unsigned packets);
+void print_counters_dsm        (const COUNTERS_DSM        *data, uint16_t vl_id, unsigned packets);
+void print_dtn_es_monitoring   (const tA664ESMonitoring   *data, uint16_t vl_id, unsigned packets);
+void print_dtn_sw_monitoring   (const tA664SWMonitoring   *data, uint16_t vl_id, unsigned packets);
 
 #endif /* HEALTH_MONITOR_H */
