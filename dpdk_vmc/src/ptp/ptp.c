@@ -169,151 +169,77 @@ static int lookup_flow(uint16_t port_id, uint16_t vl_id, uint8_t msg_type)
 }
 
 /* ------------------------------------------------------------------ */
-/* Frame builders                                                      */
+/* Frame builders — proprietary 120/124-byte layout (see ptp_wire.h)   */
 /* ------------------------------------------------------------------ */
 
-/* Fill the PTPv2 common header. Caller must set messageLength, sequenceId,
- * control, and the body that follows. */
-static void fill_ptp_header(struct ptp_header *h,
-                            uint8_t  msg_type,
-                            uint16_t length,
-                            uint8_t  domain,
-                            uint16_t sequence_id,
-                            uint8_t  control,
-                            uint8_t  ne)
+/* Build a complete eth + 802.1Q + proprietary PTP frame into `dst`.
+ *   ne, vlan_id, dst_vl_id  → addressing
+ *   msg_type                 → 0x00 Sync / 0x01 Req / 0x09 Resp
+ *   time1_ns, time2_ns       → PTP_TIME_1 / PTP_TIME_2 fields
+ *
+ * dst must have room for PTP_FRAME_VLAN_LEN (124) bytes; helper zero-fills
+ * the entire frame before writing fields so the spec's 53-byte trailing
+ * pad and the 0x00 filler at PTP_BODY_FILLER_OFF stay zero by default. */
+static void build_proprietary_frame(uint8_t *dst,
+                                    uint8_t  ne,
+                                    uint16_t vlan_id,
+                                    uint16_t dst_vl_id,
+                                    uint8_t  msg_type,
+                                    uint64_t time1_ns,
+                                    uint64_t time2_ns)
 {
-    memset(h, 0, sizeof(*h));
-    h->ts_msg      = (uint8_t)(msg_type & 0x0F);     /* transportSpecific=0 */
-    h->ver         = PTP_VERSION;                    /* reserved=0, ver=2  */
-    h->length_be   = rte_cpu_to_be_16(length);
-    h->domain      = domain;
-    /* Mirror the peer master's flagField. On the wire this is octet0=0x01
-     * (alternateMasterFlag), octet1=0x02 (leap59). The previous 0x0100 only
-     * set octet0 and left octet1=0; some strict M1 slaves reject Sync without
-     * the expected octet1 bits, which would explain why our Sync drew no
-     * Delay_Req. */
-    h->flags_be    = rte_cpu_to_be_16(0x0102);
-    /* sourcePortIdentity: 8 bytes clockIdentity + 2 bytes portNumber.
-     * clockIdentity is built as IEEE EUI-64 from a 6-byte locally-administered
-     * MAC (02:00:00:00:00:NE): insert the standard 0xFF, 0xFE flag bytes at
-     * positions 3..4. Strict M1 slaves can reject Sync from a non-EUI-64
-     * grandmaster. */
-    h->source_port_id[0] = 0x02;
-    h->source_port_id[1] = 0x00;
-    h->source_port_id[2] = 0x00;
-    h->source_port_id[3] = 0xFF;
-    h->source_port_id[4] = 0xFE;
-    h->source_port_id[5] = 0x00;
-    h->source_port_id[6] = 0x00;
-    h->source_port_id[7] = ne;
-    h->source_port_id[8] = 0x00;
-    h->source_port_id[9] = 0x01;
-    h->sequence_id_be    = rte_cpu_to_be_16(sequence_id);
-    h->control           = control;
-    /* 1 Hz Sync → logMsgInterval = 0 (2^0 = 1 s). 0x7F is a "not meaningful"
-     * sentinel that strict slaves treat as invalid and reject the message. */
-    h->log_msg_interval  = 0x00;
-}
+    memset(dst, 0, PTP_FRAME_VLAN_LEN);
 
-/* Build an Ethernet + 802.1Q + PTPv2 frame in `dst` of total length
- * `body_len + sizeof(ptp_eth_frame)`. VLAN tag is written into the packet
- * bytes (no HW offload). SRC MAC follows the existing PRBS convention
- * (02:00:00:00:00:NE), the same encoding the Cumulus switch uses to identify
- * the local network element. */
-static void build_eth_ptp(uint8_t      *dst,
-                          uint8_t       ne,
-                          uint16_t      vlan_id,
-                          uint16_t      dst_vl_id,
-                          const void   *ptp_body,
-                          uint16_t      body_len)
-{
     struct ptp_eth_frame *eth = (struct ptp_eth_frame *)dst;
 
-    /* Destination MAC = 03:00:00:00 || vl_id (BE) */
     eth->dst_mac[0] = 0x03;
-    eth->dst_mac[1] = 0x00;
-    eth->dst_mac[2] = 0x00;
-    eth->dst_mac[3] = 0x00;
     eth->dst_mac[4] = (uint8_t)((dst_vl_id >> 8) & 0xFF);
     eth->dst_mac[5] = (uint8_t)( dst_vl_id        & 0xFF);
 
     eth->src_mac[0] = 0x02;
-    eth->src_mac[1] = 0x00;
-    eth->src_mac[2] = 0x00;
-    eth->src_mac[3] = 0x00;
-    eth->src_mac[4] = 0x00;
     eth->src_mac[5] = ne;
 
     eth->vlan_tpid_be  = rte_cpu_to_be_16(PTP_VLAN_TPID);
     eth->vlan_tci_be   = rte_cpu_to_be_16((uint16_t)(vlan_id & 0x0FFF));
     eth->ether_type_be = rte_cpu_to_be_16(PTP_ETHERTYPE);
-    memcpy(dst + sizeof(*eth), ptp_body, body_len);
+
+    uint8_t *body = dst + sizeof(*eth);
+
+    body[PTP_BODY_MSG_TYPE_OFF] = msg_type;
+    memcpy(body + PTP_BODY_DATA_OFF, PTP_DATA_BLOB, PTP_DATA_LEN);
+    ptp_write_time(body + PTP_BODY_TIME1_OFF, time1_ns);
+    /* PTP_BODY_FILLER_OFF stays 0x00 from memset */
+    ptp_write_time(body + PTP_BODY_TIME2_OFF, time2_ns);
+    /* PTP_BODY_PAD_OFF..end already zero */
 }
 
-/* Build a Sync frame carrying T1 (our TX time) in originTimestamp.
- * Master role only: ATE → VMC on f->sync_vl_id at 1 Hz. The wire layout
- * mirrors the peer master byte-for-byte: messageLength = 106 with a 72-byte
- * body (10B originTimestamp + 62B zero padding) — see PTP_SYNC_PADDED_LEN. */
+/* Sync (Master → Slave): T1 in PTP_TIME_1, PTP_TIME_2 unused. */
 static void build_sync(uint8_t *dst,
                        const struct ptp_flow *f,
-                       uint16_t sequence_id,
                        uint64_t t1_ns)
 {
-    uint8_t body[PTP_SYNC_PADDED_LEN];
-    memset(body, 0, sizeof(body));
-
-    fill_ptp_header((struct ptp_header *)body,
-                    PTP_MSG_SYNC,
-                    PTP_SYNC_PADDED_LEN, /* messageLength = 106 */
-                    /* domain  */ 10,
-                    sequence_id,
-                    /* control */ 0x00,
-                    f->ne);
-
-    ptp_ns_to_ts(t1_ns,
-                 (struct ptp_timestamp *)(body + PTP_HDR_LEN));
-    /* Remaining 62 bytes already zero from memset. */
-
-    build_eth_ptp(dst, f->ne, f->sync_vlan, f->sync_vl_id,
-                  body, sizeof(body));
+    build_proprietary_frame(dst, f->ne, f->sync_vlan, f->sync_vl_id,
+                            PTP_MSG_SYNC, t1_ns, /* time2 */ 0);
 }
 
-/* Build a Delay_Resp frame echoing T3 as receiveTimestamp.
- * Per the user's spec (PTPv2 standard form): receiveTimestamp carries the
- * master's RX time of the Delay_Req — which is T3 echoed back, allowing the
- * slave to close the (T4-T3) leg. */
-static void build_delay_resp(uint8_t *dst,
-                             const struct ptp_flow *f,
-                             uint16_t sequence_id,
-                             uint64_t t3_ns,
-                             const uint8_t *requesting_port_id)
-{
-    struct ptp_msg_delay_resp body;
-    memset(&body, 0, sizeof(body));
-    fill_ptp_header(&body.hdr, PTP_MSG_DELAY_RESP,
-                    PTP_DELAY_RESP_LEN, /* domain */ 10,
-                    sequence_id, /* control */ 0x03, f->ne);
-    ptp_ns_to_ts(t3_ns, &body.receive_ts);
-    if (requesting_port_id)
-        memcpy(body.requesting_port_id, requesting_port_id, 10);
-
-    build_eth_ptp(dst, f->ne, f->resp_vlan, f->resp_vl_id, &body, PTP_DELAY_RESP_LEN);
-}
-
-/* Build a Delay_Req frame carrying T3 in originTimestamp. */
+/* Delay_Req (Slave → Master): T3 in PTP_TIME_1, PTP_TIME_2 unused. */
 static void build_delay_req(uint8_t *dst,
                             const struct ptp_flow *f,
-                            uint16_t sequence_id,
                             uint64_t t3_ns)
 {
-    struct ptp_msg_sync body;
-    memset(&body, 0, sizeof(body));
-    fill_ptp_header(&body.hdr, PTP_MSG_DELAY_REQ,
-                    PTP_DELAY_REQ_LEN, /* domain */ 10,
-                    sequence_id, /* control */ 0x01, f->ne);
-    ptp_ns_to_ts(t3_ns, &body.origin_ts);
+    build_proprietary_frame(dst, f->ne, f->req_vlan, f->req_vl_id,
+                            PTP_MSG_DELAY_REQ, t3_ns, /* time2 */ 0);
+}
 
-    build_eth_ptp(dst, f->ne, f->req_vlan, f->req_vl_id, &body, PTP_DELAY_REQ_LEN);
+/* Delay_Resp (Master → Slave): master's RX time of the Delay_Req goes in
+ * PTP_TIME_1, allowing the slave to close the (T4-T3) leg. PTP_TIME_2
+ * unused for now. */
+static void build_delay_resp(uint8_t *dst,
+                             const struct ptp_flow *f,
+                             uint64_t master_rx_ns)
+{
+    build_proprietary_frame(dst, f->ne, f->resp_vlan, f->resp_vl_id,
+                            PTP_MSG_DELAY_RESP, master_rx_ns, /* time2 */ 0);
 }
 
 /* Allocate a new mbuf, copy the supplied wire frame, pad to Ethernet min and
@@ -353,14 +279,14 @@ static int ptp_tx_frame(uint16_t port_id,
 /* ------------------------------------------------------------------ */
 
 static void handle_sync_rx(int flow_idx,
-                           const struct ptp_msg_sync *body,
+                           const uint8_t *body,
                            uint64_t t2_ns,
                            uint64_t mono_now)
 {
     struct ptp_state *st = &g_state[flow_idx];
     const struct ptp_flow *f = &ptp_flows[flow_idx];
 
-    st->last_t1_ns           = ptp_ts_to_ns(&body->origin_ts);
+    st->last_t1_ns           = ptp_read_time(body + PTP_BODY_TIME1_OFF);
     st->last_t2_ns           = t2_ns;
     st->sync_rx++;
     st->last_sync_rx_mono_ns = mono_now;
@@ -380,19 +306,18 @@ static void handle_sync_rx(int flow_idx,
     if (f->role == PTP_ROLE_M2_SLAVE) {
         /* If a previous Delay_Req is still outstanding when a new Sync
          * arrives, the master never answered it — count it as a timeout
-         * before we overwrite the timer. The worker-thread watchdog only
-         * fires when Sync stops; under steady 1 Hz traffic this path is
-         * what actually surfaces missing Delay_Resp. */
+         * before we overwrite the timer. */
         if (st->req_outstanding) {
             st->resp_timeout++;
             st->req_outstanding = false;
         }
 
         uint64_t t3 = now_real_ns();
-        uint8_t  buf[sizeof(struct ptp_eth_frame) + PTP_DELAY_REQ_LEN];
-        build_delay_req(buf, f, ++st->tx_seq, t3);
+        uint8_t  buf[PTP_FRAME_VLAN_LEN];
+        build_delay_req(buf, f, t3);
         if (ptp_tx_frame(f->dpdk_port, buf, sizeof(buf)) == 0) {
             st->last_t3_ns           = t3;
+            st->tx_seq++;
             st->req_tx++;
             st->last_req_tx_mono_ns  = mono_now;
             st->req_outstanding      = true;
@@ -403,20 +328,22 @@ static void handle_sync_rx(int flow_idx,
 }
 
 static void handle_request_rx(int flow_idx,
-                              const struct ptp_msg_sync *body,
-                              uint64_t t4_ns)
+                              const uint8_t *body,
+                              uint64_t master_rx_ns)
 {
     struct ptp_state *st = &g_state[flow_idx];
     const struct ptp_flow *f = &ptp_flows[flow_idx];
 
-    uint64_t t3 = ptp_ts_to_ns(&body->origin_ts);
-    st->last_t3_ns = t3;
-    st->last_t4_ns = t4_ns;
+    /* Slave's T3 (its Delay_Req TX time) sits in PTP_TIME_1 — we record it
+     * for debugging; the slave will reconcile (T4-T3) using our reply. */
+    st->last_t3_ns = ptp_read_time(body + PTP_BODY_TIME1_OFF);
+    st->last_t4_ns = master_rx_ns;
     st->req_rx++;
 
-    uint16_t seq = rte_be_to_cpu_16(body->hdr.sequence_id_be);
-    uint8_t  buf[sizeof(struct ptp_eth_frame) + PTP_DELAY_RESP_LEN];
-    build_delay_resp(buf, f, seq, t3, body->hdr.source_port_id);
+    /* Echo our local RX time in PTP_TIME_1 of the Delay_Resp — slave reads
+     * it as T4. */
+    uint8_t  buf[PTP_FRAME_VLAN_LEN];
+    build_delay_resp(buf, f, master_rx_ns);
     if (ptp_tx_frame(f->dpdk_port, buf, sizeof(buf)) == 0) {
         st->resp_tx++;
     } else {
@@ -425,14 +352,12 @@ static void handle_request_rx(int flow_idx,
 }
 
 static void handle_response_rx(int flow_idx,
-                               const struct ptp_msg_delay_resp *body)
+                               const uint8_t *body)
 {
     struct ptp_state *st = &g_state[flow_idx];
 
-    /* T4 = master's RX timestamp of our Delay_Req (echoed in receiveTimestamp).
-     * The user requested no sequenceId matching, so we just close the most
-     * recent outstanding request. */
-    st->last_t4_ns = ptp_ts_to_ns(&body->receive_ts);
+    /* Master echoes T4 (its RX time of our Delay_Req) in PTP_TIME_1. */
+    st->last_t4_ns = ptp_read_time(body + PTP_BODY_TIME1_OFF);
     st->resp_rx++;
     st->req_outstanding = false;
 }
@@ -449,9 +374,8 @@ static void rx_one_port(uint16_t port_id)
         struct rte_mbuf *m = bufs[i];
         uint64_t t_rx = now_real_ns();
 
-        /* Minimum: ETH+VLAN (18B) + 34 PTP header */
-        if (m->data_len < sizeof(struct ptp_eth_frame) + PTP_HDR_LEN) {
-            /* attribute to no flow — count as bad on first matching port flow */
+        /* Minimum: full proprietary frame = eth + 802.1Q + 106B body. */
+        if (m->data_len < PTP_FRAME_VLAN_LEN) {
             for (int k = 0; k < PTP_NUM_FLOWS; k++)
                 if (ptp_flows[k].dpdk_port == port_id) {
                     g_state[k].bad_size++;
@@ -463,14 +387,12 @@ static void rx_one_port(uint16_t port_id)
 
         const uint8_t *p = rte_pktmbuf_mtod(m, const uint8_t *);
         const struct ptp_eth_frame *eth = (const struct ptp_eth_frame *)p;
+        const uint8_t *body = p + sizeof(*eth);
 
         /* Dest MAC bytes 4..5 = VL-IDX (big-endian) */
         uint16_t vl_id   = ((uint16_t)eth->dst_mac[4] << 8) | eth->dst_mac[5];
         uint8_t  src_ne  = eth->src_mac[5];
-
-        const struct ptp_header *hdr =
-            (const struct ptp_header *)(p + sizeof(*eth));
-        uint8_t msg_type = hdr->ts_msg & 0x0F;
+        uint8_t  msg_type = body[PTP_BODY_MSG_TYPE_OFF];
 
         int idx = lookup_flow(port_id, vl_id, msg_type);
         if (idx < 0) {
@@ -519,36 +441,15 @@ static void rx_one_port(uint16_t port_id)
         }
 
         switch (msg_type) {
-        case PTP_MSG_SYNC: {
-            if (m->data_len < sizeof(*eth) + PTP_SYNC_LEN) {
-                g_state[idx].bad_size++;
-                break;
-            }
-            const struct ptp_msg_sync *body =
-                (const struct ptp_msg_sync *)(p + sizeof(*eth));
+        case PTP_MSG_SYNC:
             handle_sync_rx(idx, body, t_rx, mono_now);
             break;
-        }
-        case PTP_MSG_DELAY_REQ: {
-            if (m->data_len < sizeof(*eth) + PTP_DELAY_REQ_LEN) {
-                g_state[idx].bad_size++;
-                break;
-            }
-            const struct ptp_msg_sync *body =
-                (const struct ptp_msg_sync *)(p + sizeof(*eth));
+        case PTP_MSG_DELAY_REQ:
             handle_request_rx(idx, body, t_rx);
             break;
-        }
-        case PTP_MSG_DELAY_RESP: {
-            if (m->data_len < sizeof(*eth) + PTP_DELAY_RESP_LEN) {
-                g_state[idx].bad_size++;
-                break;
-            }
-            const struct ptp_msg_delay_resp *body =
-                (const struct ptp_msg_delay_resp *)(p + sizeof(*eth));
+        case PTP_MSG_DELAY_RESP:
             handle_response_rx(idx, body);
             break;
-        }
         default:
             g_state[idx].bad_msg_type++;
             break;
@@ -588,10 +489,11 @@ static void *ptp_thread_fn(void *arg)
                 mono - st->last_sync_tx_mono_ns < 1000000000ULL) continue;
 
             uint64_t t1 = now_real_ns();
-            uint8_t  buf[sizeof(struct ptp_eth_frame) + PTP_SYNC_PADDED_LEN];
-            build_sync(buf, f, ++st->tx_seq, t1);
+            uint8_t  buf[PTP_FRAME_VLAN_LEN];
+            build_sync(buf, f, t1);
             if (ptp_tx_frame(f->dpdk_port, buf, sizeof(buf)) == 0) {
                 st->sync_tx++;
+                st->tx_seq++;
                 st->last_sync_tx_mono_ns = mono;
             } else {
                 st->tx_fail++;

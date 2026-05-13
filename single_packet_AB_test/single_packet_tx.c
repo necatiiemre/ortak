@@ -1,13 +1,17 @@
 /*
- * Dual PTP Sync TX (raw socket, sendmmsg)
+ * Dual Proprietary-PTP Sync TX (raw socket, sendmmsg)
  *
- * dpdk_vmc tarafindaki M1 master akisini (ptp_flows[0] ve [1]) bagimsiz
- * uretmek icin standalone test araci. Her saniyede 2 paket gonderir:
+ * dpdk_vmc tarafindaki M1 master Sync akisini (ptp_flows[0] ve [1])
+ * bagimsiz uretmek icin standalone test araci. Her saniyede 2 paket gonderir:
  *   - NE_A: VLAN 100, VL-ID 1500, src MAC 02:00:00:00:00:20
  *   - NE_B: VLAN 97,  VL-ID 1501, src MAC 02:00:00:00:00:40
  *
- * Frame layout (FCS haric, toplam 62 B):
- *   eth(14) + 802.1Q(4) + PTPv2 Sync(44)
+ * Frame layout — sahanin proprietary spec'i (124 byte, vlan'li):
+ *   eth(14) + 802.1Q(4) + MSG_TYPE(1) + PTP_DATA(35) + PTP_TIME_1(8)
+ *   + filler(1) + PTP_TIME_2(8) + pad(53) = 124
+ *
+ * PTP_DATA sabit blob, PTP_TIME alanlari 4B sec BE + 4B ns BE (PTPv2'nin
+ * 10B timestamp formati DEGIL).
  *
  * Derleme:   make
  * Calistir:  sudo ./single_packet_tx
@@ -41,7 +45,7 @@
 #define VLAN_PRIORITY      0
 #define PTP_ETHERTYPE      0x88F7
 
-/* M1 master flow tablosundan (dpdk_vmc/src/ptp/ptp.c:42-43) */
+/* M1 master flow tablosundan (dpdk_vmc/src/ptp/ptp.c) */
 #define NE_A               0x20
 #define NE_B               0x40
 
@@ -53,40 +57,48 @@
 #define VL_ID_B            1501
 #define SRC_MAC_B          { 0x02, 0x00, 0x00, 0x00, 0x00, NE_B }
 
-/* dst MAC = 03:00:00:00 || VL-ID (BE) — build_eth_ptp ile ayni kural */
+/* dst MAC = 03:00:00:00 || VL-ID (BE) */
 #define DST_MAC_PREFIX     { 0x03, 0x00, 0x00, 0x00 }
 
-/* PTPv2 ortak header + Sync gövde sabitleri (ptp_wire.h ile ayni) */
-#define PTP_VERSION        0x02
+/* Proprietary PTP MSG_TYPE */
 #define PTP_MSG_SYNC       0x00
-#define PTP_HDR_LEN          34
-#define PTP_SYNC_PADDED_LEN  106                  /* peer master byte-for-byte: hdr(34)+ts(10)+pad(62) */
-#define PTP_DOMAIN           10
-#define PTP_FLAGS            0x0102               /* alternateMaster | leap59 — peer master uyumu */
-#define PTP_CONTROL_SYNC     0x00
-#define PTP_LOG_MSG_INT      0x00                 /* 1 Hz Sync → 2^0 = 1 s */
+#define PTP_MSG_REQUEST    0x01
+#define PTP_MSG_RESPONSE   0x09
 
+/* Frame offsets (vlan-tagged 124 byte total) */
 #define ETH_HDR_LEN          14
 #define VLAN_HDR_LEN         4
-#define PACKET_SIZE          (ETH_HDR_LEN + VLAN_HDR_LEN + PTP_SYNC_PADDED_LEN)  /* 124 */
+#define PTP_BODY_LEN         106
+#define PACKET_SIZE          (ETH_HDR_LEN + VLAN_HDR_LEN + PTP_BODY_LEN)  /* 124 */
+
+#define BODY_MSG_TYPE_OFF    0
+#define BODY_DATA_OFF        1
+#define PTP_DATA_LEN         35
+#define BODY_TIME1_OFF       (BODY_DATA_OFF + PTP_DATA_LEN)               /* 36 */
+#define BODY_FILLER_OFF      (BODY_TIME1_OFF + 8)                         /* 44 */
+#define BODY_TIME2_OFF       (BODY_FILLER_OFF + 1)                        /* 45 */
+
+/* Sabit PTP_DATA blob — saha spec'inde verildigi gibi 35 byte. */
+static const uint8_t PTP_DATA_BLOB[PTP_DATA_LEN] = {
+    0x02, 0x00, 0x6a, 0x0b, 0x00, 0x01, 0x02, 0x00,
+    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+    0x00, 0x00, 0x00, 0x6d, 0x61, 0x73, 0x74, 0x65,
+    0x72, 0x64, 0x65, 0x76, 0x2e, 0x00, 0x02, 0x00,
+    0x00, 0x00, 0x00
+};
 
 /* ========================================== */
-/* PTP TIMESTAMP                               */
+/* TIMESTAMP                                   */
 /* ========================================== */
 
-/* 48-bit BE seconds + 32-bit BE nanoseconds, ptp_ns_to_ts ile ayni encoding */
-static void ptp_ns_to_ts(uint64_t ns, uint8_t out[10])
+static void write_ptp_time(uint8_t *dst, uint64_t ns)
 {
-    uint64_t sec = ns / 1000000000ULL;
+    uint32_t sec = (uint32_t)(ns / 1000000000ULL);
     uint32_t rem = (uint32_t)(ns % 1000000000ULL);
-    out[0] = (uint8_t)((sec >> 40) & 0xFF);
-    out[1] = (uint8_t)((sec >> 32) & 0xFF);
-    out[2] = (uint8_t)((sec >> 24) & 0xFF);
-    out[3] = (uint8_t)((sec >> 16) & 0xFF);
-    out[4] = (uint8_t)((sec >>  8) & 0xFF);
-    out[5] = (uint8_t)( sec        & 0xFF);
-    uint32_t rem_be = htonl(rem);
-    memcpy(out + 6, &rem_be, 4);
+    uint32_t sec_be = htonl(sec);
+    uint32_t ns_be  = htonl(rem);
+    memcpy(dst,     &sec_be, 4);
+    memcpy(dst + 4, &ns_be,  4);
 }
 
 static uint64_t now_real_ns(void)
@@ -101,12 +113,12 @@ static uint64_t now_real_ns(void)
 /* ========================================== */
 
 static void build_packet(uint8_t *pkt,
-                         uint16_t sequence_id,
                          uint16_t vlan_id,
                          uint16_t vl_id,
                          const uint8_t *src_mac,
-                         uint8_t ne,
-                         uint64_t t1_ns)
+                         uint8_t msg_type,
+                         uint64_t time1_ns,
+                         uint64_t time2_ns)
 {
     memset(pkt, 0, PACKET_SIZE);
 
@@ -126,52 +138,32 @@ static void build_packet(uint8_t *pkt,
     pkt[16] = (PTP_ETHERTYPE >> 8) & 0xFF;
     pkt[17] =  PTP_ETHERTYPE       & 0xFF;
 
-    /* --- PTPv2 ortak header (34 B) --- */
-    uint8_t *p = pkt + 18;
-    p[0]  = PTP_MSG_SYNC & 0x0F;          /* transportSpecific=0 | msgType=Sync */
-    p[1]  = PTP_VERSION;                  /* reserved=0 | ver=2 */
-    p[2]  = (PTP_SYNC_PADDED_LEN >> 8) & 0xFF;   /* messageLength BE = 106 */
-    p[3]  =  PTP_SYNC_PADDED_LEN       & 0xFF;
-    p[4]  = PTP_DOMAIN;
-    p[5]  = 0;                            /* reserved */
-    p[6]  = (PTP_FLAGS >> 8) & 0xFF;      /* flagField BE */
-    p[7]  =  PTP_FLAGS       & 0xFF;
-    /* p[8..15]  correctionField (8B) = 0 */
-    /* p[16..19] reserved (4B)         = 0 */
-    /* sourcePortIdentity (10B): clockIdentity(8) + portNumber(2).
-     * clockIdentity = IEEE EUI-64 türetimli: 02:00:00:FF:FE:00:00:NE
-     * (locally-administered MAC 02:00:00:00:00:NE + middle FF FE flag).
-     * PTPv2 strict slave'leri non-EUI-64 grandmaster reject edebilir. */
-    p[20] = 0x02;
-    p[23] = 0xFF;
-    p[24] = 0xFE;
-    p[27] = ne;
-    p[28] = 0x00;
-    p[29] = 0x01;
-    p[30] = (sequence_id >> 8) & 0xFF;    /* sequenceId BE */
-    p[31] =  sequence_id       & 0xFF;
-    p[32] = PTP_CONTROL_SYNC;
-    p[33] = PTP_LOG_MSG_INT;
-
-    /* --- Sync gövdesi: originTimestamp (10 B) --- */
-    ptp_ns_to_ts(t1_ns, p + 34);
+    /* --- Proprietary PTP body (106 B), eth+vlan sonrasi offset 18 --- */
+    uint8_t *body = pkt + 18;
+    body[BODY_MSG_TYPE_OFF] = msg_type;
+    memcpy(body + BODY_DATA_OFF, PTP_DATA_BLOB, PTP_DATA_LEN);
+    write_ptp_time(body + BODY_TIME1_OFF, time1_ns);
+    /* BODY_FILLER_OFF zaten 0x00 (memset) */
+    write_ptp_time(body + BODY_TIME2_OFF, time2_ns);
+    /* Geri kalan 53 byte pad zaten 0x00 */
 }
 
 /* ========================================== */
 /* TRACE                                       */
 /* ========================================== */
 
-static void trace_packet(const uint8_t *pkt, uint16_t seq, uint64_t t1_ns, const char *label)
+static void trace_packet(const uint8_t *pkt, uint64_t t1_ns, const char *label)
 {
     uint16_t tci = ((uint16_t)pkt[14] << 8) | pkt[15];
     uint16_t vlan_id = tci & 0x0FFF;
     uint16_t vl_id   = ((uint16_t)pkt[4] << 8) | pkt[5];
 
-    printf("[%s] seq=%-5u VLAN=%-3u VL-ID=%-4u T1=%" PRIu64
-           "  DA=%02x:%02x:%02x:%02x:%02x:%02x  SA=%02x:%02x:%02x:%02x:%02x:%02x\n",
-           label, seq, vlan_id, vl_id, t1_ns,
+    printf("[%s] VLAN=%-3u VL-ID=%-4u T1=%" PRIu64
+           "  DA=%02x:%02x:%02x:%02x:%02x:%02x  SA=%02x:%02x:%02x:%02x:%02x:%02x  len=%d\n",
+           label, vlan_id, vl_id, t1_ns,
            pkt[0], pkt[1], pkt[2], pkt[3], pkt[4], pkt[5],
-           pkt[6], pkt[7], pkt[8], pkt[9], pkt[10], pkt[11]);
+           pkt[6], pkt[7], pkt[8], pkt[9], pkt[10], pkt[11],
+           PACKET_SIZE);
 }
 
 /* ========================================== */
@@ -180,12 +172,12 @@ static void trace_packet(const uint8_t *pkt, uint16_t seq, uint64_t t1_ns, const
 
 int main(void)
 {
-    printf("=== Dual PTP Sync TX ===\n");
+    printf("=== Dual Proprietary-PTP Sync TX ===\n");
     printf("Interface: %s\n", INTERFACE);
     printf("NE_A: VLAN %u, VL-ID %u\n", VLAN_ID_A, VL_ID_A);
     printf("NE_B: VLAN %u, VL-ID %u\n", VLAN_ID_B, VL_ID_B);
-    printf("Frame size (no FCS): %d byte\n", PACKET_SIZE);
-    printf("==========================\n\n");
+    printf("Frame size: %d byte (vlan'li)\n", PACKET_SIZE);
+    printf("====================================\n\n");
 
     int sock = socket(AF_PACKET, SOCK_RAW, htons(ETH_P_ALL));
     if (sock < 0) { perror("socket"); return 1; }
@@ -199,7 +191,6 @@ int main(void)
         return 1;
     }
 
-    /* Iki ayri sockaddr — dst MAC'ler farkli (VL-ID 1500 vs 1501) */
     struct sockaddr_ll saddr_a, saddr_b;
     uint8_t dst_prefix[] = DST_MAC_PREFIX;
 
@@ -224,16 +215,15 @@ int main(void)
     struct mmsghdr msgs[2];
     struct iovec   iovecs[2];
 
-    uint16_t seq = 0;
     printf("Gonderim basliyor... (Ctrl+C ile durdur)\n\n");
 
     while (1) {
         uint64_t t1 = now_real_ns();
-        build_packet(pkt_a, seq, VLAN_ID_A, VL_ID_A, src_mac_a, NE_A, t1);
-        build_packet(pkt_b, seq, VLAN_ID_B, VL_ID_B, src_mac_b, NE_B, t1);
+        build_packet(pkt_a, VLAN_ID_A, VL_ID_A, src_mac_a, PTP_MSG_SYNC, t1, 0);
+        build_packet(pkt_b, VLAN_ID_B, VL_ID_B, src_mac_b, PTP_MSG_SYNC, t1, 0);
 
-        trace_packet(pkt_a, seq, t1, "TX-A");
-        trace_packet(pkt_b, seq, t1, "TX-B");
+        trace_packet(pkt_a, t1, "TX-A");
+        trace_packet(pkt_b, t1, "TX-B");
 
         memset(msgs, 0, sizeof(msgs));
 
@@ -255,10 +245,9 @@ int main(void)
         if (n == -1) {
             perror("sendmmsg");
         } else {
-            printf("  -> %d PTP Sync paketi gonderildi (seq=%u)\n\n", n, seq);
+            printf("  -> %d Sync paketi gonderildi (T1=%" PRIu64 ")\n\n", n, t1);
         }
 
-        seq++;
         sleep(TX_INTERVAL_SEC);
     }
 
