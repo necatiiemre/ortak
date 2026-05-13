@@ -67,10 +67,14 @@ struct ptp_state {
 
     /* Counters — written only by the PTP thread, so plain uint64_t. */
     uint64_t sync_rx;
+    uint64_t sync_tx;       /* M1 only */
     uint64_t req_rx;        /* M1 only */
     uint64_t resp_tx;       /* M1 only */
     uint64_t req_tx;        /* M2 only */
     uint64_t resp_rx;       /* M2 only */
+
+    /* M1 Sync TX pacing (MONOTONIC ns) */
+    uint64_t last_sync_tx_mono_ns;
 
     uint64_t bad_vlan;
     uint64_t bad_ne;
@@ -228,6 +232,23 @@ static void build_eth_ptp(uint8_t      *dst,
     eth->src_mac[5] = ne;
     eth->ether_type_be = rte_cpu_to_be_16(PTP_ETHERTYPE);
     memcpy(dst + sizeof(*eth), ptp_body, body_len);
+}
+
+/* Build a Sync frame carrying T1 (our TX time) in originTimestamp.
+ * Master role only: ATE → VMC on f->sync_vl_id at 1 Hz. */
+static void build_sync(uint8_t *dst,
+                       const struct ptp_flow *f,
+                       uint16_t sequence_id,
+                       uint64_t t1_ns)
+{
+    struct ptp_msg_sync body;
+    memset(&body, 0, sizeof(body));
+    fill_ptp_header(&body.hdr, PTP_MSG_SYNC,
+                    PTP_SYNC_LEN, /* domain */ 10,
+                    sequence_id, /* control */ 0x00, f->ne);
+    ptp_ns_to_ts(t1_ns, &body.origin_ts);
+
+    build_eth_ptp(dst, f->ne, f->sync_vl_id, &body, PTP_SYNC_LEN);
 }
 
 /* Build a Delay_Resp frame echoing T3 as receiveTimestamp.
@@ -531,9 +552,31 @@ static void *ptp_thread_fn(void *arg)
         for (uint16_t i = 0; i < g_ptp_port_count; i++)
             rx_one_port(g_ptp_ports[i]);
 
+        uint64_t mono = now_mono_ns();
+
+        /* M1 Master: emit Sync at 1 Hz per flow. T1 = our TX time
+         * (CLOCK_REALTIME); slave subtracts its RX time T2 to estimate the
+         * one-way path. */
+        for (int k = 0; k < PTP_NUM_FLOWS; k++) {
+            const struct ptp_flow *f = &ptp_flows[k];
+            struct ptp_state *st = &g_state[k];
+            if (f->role != PTP_ROLE_M1_MASTER) continue;
+            if (st->last_sync_tx_mono_ns &&
+                mono - st->last_sync_tx_mono_ns < 1000000000ULL) continue;
+
+            uint64_t t1 = now_real_ns();
+            uint8_t  buf[14 + PTP_SYNC_LEN];
+            build_sync(buf, f, ++st->tx_seq, t1);
+            if (ptp_tx_frame(f->dpdk_port, f->sync_vlan, buf, sizeof(buf)) == 0) {
+                st->sync_tx++;
+                st->last_sync_tx_mono_ns = mono;
+            } else {
+                st->tx_fail++;
+            }
+        }
+
         /* Watchdog: any outstanding Delay_Req older than 1 s without a
          * matching Delay_Resp counts as a timeout and is cleared. */
-        uint64_t mono = now_mono_ns();
         for (int k = 0; k < PTP_NUM_FLOWS; k++) {
             struct ptp_state *st = &g_state[k];
             if (ptp_flows[k].role == PTP_ROLE_M2_SLAVE &&
@@ -706,7 +749,7 @@ void ptp_print_dashboard(void)
 {
     printf("\n[PTP] role-aware 1588v2  (M1=Master, M2=Slave)\n");
     printf("┌────┬──────┬────┬────┬──┬────────────────┬────────┬────────┬────────┬────────┬─────────┬────────────┬────────────┬────────────┬────────────┐\n");
-    printf("│ #  │ Lbl  │ Pt │Role│NE│ VL-IDs S/Rq/Rs │ SyncRx │ ReqRx  │ RspTx  │ ReqTx  │ RspRx/TO│ T2-T1 (us) │ T4-T3 (us) │ offset(us) │ delay (us) │\n");
+    printf("│ #  │ Lbl  │ Pt │Role│NE│ VL-IDs S/Rq/Rs │ Sync   │ ReqRx  │ RspTx  │ ReqTx  │ RspRx/TO│ T2-T1 (us) │ T4-T3 (us) │ offset(us) │ delay (us) │\n");
     printf("├────┼──────┼────┼────┼──┼────────────────┼────────┼────────┼────────┼────────┼─────────┼────────────┼────────────┼────────────┼────────────┤\n");
     for (int i = 0; i < PTP_NUM_FLOWS; i++) {
         const struct ptp_flow *f = &ptp_flows[i];
@@ -761,12 +804,16 @@ void ptp_print_dashboard(void)
             snprintf(delay_s, sizeof(delay_s), "%10s", "-");
         }
 
+        /* SyncRx column shows TX count for M1 (master emits Sync), RX count
+         * for M2 (slave receives Sync). */
+        uint64_t sync_count = (f->role == PTP_ROLE_M1_MASTER) ? s->sync_tx
+                                                              : s->sync_rx;
         printf("│ %2d │ %-4s │ %2u │ M%c │%c │ %5u/%4u/%4u │ %6lu │ %6s │ %6s │ %6s │ %7s │ %s │ %s │ %s │ %s │\n",
                i, f->j_label, (unsigned)f->dpdk_port,
                (f->role == PTP_ROLE_M1_MASTER) ? '1' : '2',
                ne_c,
                f->sync_vl_id, f->req_vl_id, f->resp_vl_id,
-               (unsigned long)s->sync_rx,
+               (unsigned long)sync_count,
                req_rx_s, resp_tx_s,
                req_tx_s, resp_rx_s,
                dt_sync_s, dt_req_s, offs_s, delay_s);
