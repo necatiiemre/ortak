@@ -194,9 +194,17 @@ static void fill_ptp_header(struct ptp_header *h,
      * Delay_Req. */
     h->flags_be    = rte_cpu_to_be_16(0x0102);
     /* sourcePortIdentity: 8 bytes clockIdentity + 2 bytes portNumber.
-     * Encode our local clockIdentity from the NE code so a wire capture is
-     * self-describing. */
+     * clockIdentity is built as IEEE EUI-64 from a 6-byte locally-administered
+     * MAC (02:00:00:00:00:NE): insert the standard 0xFF, 0xFE flag bytes at
+     * positions 3..4. Strict M1 slaves can reject Sync from a non-EUI-64
+     * grandmaster. */
     h->source_port_id[0] = 0x02;
+    h->source_port_id[1] = 0x00;
+    h->source_port_id[2] = 0x00;
+    h->source_port_id[3] = 0xFF;
+    h->source_port_id[4] = 0xFE;
+    h->source_port_id[5] = 0x00;
+    h->source_port_id[6] = 0x00;
     h->source_port_id[7] = ne;
     h->source_port_id[8] = 0x00;
     h->source_port_id[9] = 0x01;

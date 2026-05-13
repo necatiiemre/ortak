@@ -138,8 +138,13 @@ static void build_packet(uint8_t *pkt,
     p[7]  =  PTP_FLAGS       & 0xFF;
     /* p[8..15]  correctionField (8B) = 0 */
     /* p[16..19] reserved (4B)         = 0 */
-    /* sourcePortIdentity (10B): clockIdentity(8) + portNumber(2) */
+    /* sourcePortIdentity (10B): clockIdentity(8) + portNumber(2).
+     * clockIdentity = IEEE EUI-64 türetimli: 02:00:00:FF:FE:00:00:NE
+     * (locally-administered MAC 02:00:00:00:00:NE + middle FF FE flag).
+     * PTPv2 strict slave'leri non-EUI-64 grandmaster reject edebilir. */
     p[20] = 0x02;
+    p[23] = 0xFF;
+    p[24] = 0xFE;
     p[27] = ne;
     p[28] = 0x00;
     p[29] = 0x01;
