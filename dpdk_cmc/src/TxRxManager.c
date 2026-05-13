@@ -11,7 +11,7 @@
 // Health monitor disabled in CMC for now — CMC will get its own HM later.
 // Source files (src/health_monitor/) still compile but no call sites in
 // TxRxManager / main reference them.
-// #include <health_monitor.h>
+#include <health_monitor.h>
 
 // ==========================================
 // SPLITMIX64 + CRC32C + XOR-ZONE PAYLOAD VERIFICATION
@@ -1755,23 +1755,23 @@ int rx_worker(void *arg)
                 const uint32_t payload_off = l2_len_vlan + 20 + 8;
 
                 // ==========================================
-                // HEALTH MONITOR EARLY BRANCH (DISABLED IN CMC)
-                // CMC'den miras kalan HM dispatch'i — VL-ID 0x09..0x10
-                // aralığını yakalayıp hm_handle_packet'e veriyordu. CMC kendi
-                // HM'sini ekleyene kadar yorum satırında. Aktive ederken
-                // <health_monitor.h> include'ını da TxRxManager.c üstünde
-                // geri açmak gerekir.
+                // CMC HEALTH MONITOR EARLY BRANCH
+                // HM paketleri PRBS paketlerinden çok daha küçük olduğu için
+                // PRBS min_len_vlan filtresinden ÖNCE kontrol edilmeli (aksi
+                // halde "short" olarak düşer). VL-ID set kontrolü
+                // (2021/2042/2063/2084/2105/8009/8109) hm_is_health_monitor_vl_id'de.
+                // Tür ayrımı hm_handle_packet içinde payload uzunluğuna göre.
                 // ==========================================
-                // if (likely(m->pkt_len >= payload_off))
-                // {
-                //     uint16_t vl_id_hm = extract_vl_id_from_packet(pkt, l2_len_vlan);
-                //     if (unlikely(hm_is_health_monitor_vl_id(vl_id_hm)))
-                //     {
-                //         uint16_t hm_len = (uint16_t)(m->pkt_len - payload_off);
-                //         hm_handle_packet(vl_id_hm, pkt + payload_off, hm_len);
-                //         continue;
-                //     }
-                // }
+                if (likely(m->pkt_len >= payload_off))
+                {
+                    uint16_t vl_id_hm = extract_vl_id_from_packet(pkt, l2_len_vlan);
+                    if (unlikely(hm_is_health_monitor_vl_id(vl_id_hm)))
+                    {
+                        uint16_t hm_len = (uint16_t)(m->pkt_len - payload_off);
+                        hm_handle_packet(vl_id_hm, pkt + payload_off, hm_len);
+                        continue;
+                    }
+                }
 
 #if IMIX_ENABLED
                 // IMIX minimum: 100 bytes
