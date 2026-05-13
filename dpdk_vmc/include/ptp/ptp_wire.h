@@ -58,11 +58,16 @@ struct ptp_msg_delay_resp {
     uint8_t               requesting_port_id[10];
 } __attribute__((packed));
 
-/* Ethernet + PTP frame (HW VLAN offload — no VLAN bytes in mbuf). */
+/* Ethernet + inline 802.1Q + PTP frame. VLAN is written into the packet
+ * bytes by build_eth_ptp (no HW offload), mirroring the PRBS path so we are
+ * not dependent on RTE_ETH_TX_OFFLOAD_VLAN_INSERT being negotiated. */
+#define PTP_VLAN_TPID          0x8100
 struct ptp_eth_frame {
     uint8_t  dst_mac[6];
     uint8_t  src_mac[6];
-    uint16_t ether_type_be;        /* 0x88F7 */
+    uint16_t vlan_tpid_be;         /* 0x8100 */
+    uint16_t vlan_tci_be;          /* (priority << 13) | vlan_id */
+    uint16_t ether_type_be;        /* inner = 0x88F7 */
     /* PTP payload follows */
 } __attribute__((packed));
 

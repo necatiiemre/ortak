@@ -8,10 +8,9 @@
  * Both mechanisms share one dedicated RX queue and one dedicated TX queue per
  * carrying NIC port (see PTP_RX_QUEUE_ID / PTP_TX_QUEUE_ID). EtherType=0x88F7
  * is steered to the PTP RX queue via an rte_flow rule installed after port
- * start. VLAN handling uses HW offload (mbuf->vlan_tci + RTE_MBUF_F_TX_VLAN /
- * RTE_MBUF_F_RX_VLAN_STRIPPED): the Cumulus switch removes the tag in the
- * Unit-bound direction and re-inserts it on the return path, so the DPDK side
- * always sees / emits tagged frames at the NIC. */
+ * start. VLAN tag is written inline by build_eth_ptp (PRBS-style — no HW
+ * offload), since RTE_ETH_TX_OFFLOAD_VLAN_INSERT is not negotiated on the
+ * shared port_conf used by the PRBS data plane. */
 
 #include "ptp.h"
 #include "ptp_wire.h"
@@ -204,12 +203,14 @@ static void fill_ptp_header(struct ptp_header *h,
     h->log_msg_interval  = 0x7F;
 }
 
-/* Build an Ethernet+PTPv2 frame in `dst` of total length `body_len + 14`.
- * VLAN tag is NOT embedded — caller sets mbuf->vlan_tci with TX offload.
- * SRC MAC follows the existing PRBS convention (02:00:00:00:00:NE), the same
- * encoding the Cumulus switch uses to identify the local network element. */
+/* Build an Ethernet + 802.1Q + PTPv2 frame in `dst` of total length
+ * `body_len + sizeof(ptp_eth_frame)`. VLAN tag is written into the packet
+ * bytes (no HW offload). SRC MAC follows the existing PRBS convention
+ * (02:00:00:00:00:NE), the same encoding the Cumulus switch uses to identify
+ * the local network element. */
 static void build_eth_ptp(uint8_t      *dst,
                           uint8_t       ne,
+                          uint16_t      vlan_id,
                           uint16_t      dst_vl_id,
                           const void   *ptp_body,
                           uint16_t      body_len)
@@ -230,6 +231,9 @@ static void build_eth_ptp(uint8_t      *dst,
     eth->src_mac[3] = 0x00;
     eth->src_mac[4] = 0x00;
     eth->src_mac[5] = ne;
+
+    eth->vlan_tpid_be  = rte_cpu_to_be_16(PTP_VLAN_TPID);
+    eth->vlan_tci_be   = rte_cpu_to_be_16((uint16_t)(vlan_id & 0x0FFF));
     eth->ether_type_be = rte_cpu_to_be_16(PTP_ETHERTYPE);
     memcpy(dst + sizeof(*eth), ptp_body, body_len);
 }
@@ -248,7 +252,7 @@ static void build_sync(uint8_t *dst,
                     sequence_id, /* control */ 0x00, f->ne);
     ptp_ns_to_ts(t1_ns, &body.origin_ts);
 
-    build_eth_ptp(dst, f->ne, f->sync_vl_id, &body, PTP_SYNC_LEN);
+    build_eth_ptp(dst, f->ne, f->sync_vlan, f->sync_vl_id, &body, PTP_SYNC_LEN);
 }
 
 /* Build a Delay_Resp frame echoing T3 as receiveTimestamp.
@@ -270,7 +274,7 @@ static void build_delay_resp(uint8_t *dst,
     if (requesting_port_id)
         memcpy(body.requesting_port_id, requesting_port_id, 10);
 
-    build_eth_ptp(dst, f->ne, f->resp_vl_id, &body, PTP_DELAY_RESP_LEN);
+    build_eth_ptp(dst, f->ne, f->resp_vlan, f->resp_vl_id, &body, PTP_DELAY_RESP_LEN);
 }
 
 /* Build a Delay_Req frame carrying T3 in originTimestamp. */
@@ -286,21 +290,21 @@ static void build_delay_req(uint8_t *dst,
                     sequence_id, /* control */ 0x01, f->ne);
     ptp_ns_to_ts(t3_ns, &body.origin_ts);
 
-    build_eth_ptp(dst, f->ne, f->req_vl_id, &body, PTP_DELAY_REQ_LEN);
+    build_eth_ptp(dst, f->ne, f->req_vlan, f->req_vl_id, &body, PTP_DELAY_REQ_LEN);
 }
 
-/* Allocate a new mbuf, build the supplied frame body, set VLAN offload, and
- * burst-TX on the dedicated PTP queue. Returns 0 on success. */
+/* Allocate a new mbuf, copy the supplied wire frame, pad to Ethernet min and
+ * burst-TX on the dedicated PTP queue. Frame is expected to already include
+ * the 802.1Q tag (written inline by build_eth_ptp). Returns 0 on success. */
 static int ptp_tx_frame(uint16_t port_id,
-                        uint16_t vlan_tci,
                         const void *frame,
                         uint16_t frame_len)
 {
     struct rte_mbuf *m = rte_pktmbuf_alloc(g_ptp_mempool);
     if (!m) return -1;
 
-    /* Pad the wire frame up to 60 bytes (Ethernet min minus FCS, before VLAN
-     * tag insertion). Some NICs require this; cost is negligible. */
+    /* Pad the wire frame up to 60 bytes (Ethernet min minus FCS). Some NICs
+     * require this; cost is negligible. */
     uint16_t out_len = frame_len < 60 ? 60 : frame_len;
     uint8_t *out = (uint8_t *)rte_pktmbuf_append(m, out_len);
     if (!out) {
@@ -311,9 +315,7 @@ static int ptp_tx_frame(uint16_t port_id,
     if (out_len > frame_len)
         memset(out + frame_len, 0, out_len - frame_len);
 
-    m->vlan_tci  = vlan_tci;
-    m->ol_flags |= RTE_MBUF_F_TX_VLAN;
-    m->l2_len    = sizeof(struct ptp_eth_frame);
+    m->l2_len = sizeof(struct ptp_eth_frame);
 
     uint16_t sent = rte_eth_tx_burst(port_id, PTP_TX_QUEUE_ID, &m, 1);
     if (sent != 1) {
@@ -364,9 +366,9 @@ static void handle_sync_rx(int flow_idx,
         }
 
         uint64_t t3 = now_real_ns();
-        uint8_t  buf[14 + PTP_DELAY_REQ_LEN];
+        uint8_t  buf[sizeof(struct ptp_eth_frame) + PTP_DELAY_REQ_LEN];
         build_delay_req(buf, f, ++st->tx_seq, t3);
-        if (ptp_tx_frame(f->dpdk_port, f->req_vlan, buf, sizeof(buf)) == 0) {
+        if (ptp_tx_frame(f->dpdk_port, buf, sizeof(buf)) == 0) {
             st->last_t3_ns           = t3;
             st->req_tx++;
             st->last_req_tx_mono_ns  = mono_now;
@@ -390,9 +392,9 @@ static void handle_request_rx(int flow_idx,
     st->req_rx++;
 
     uint16_t seq = rte_be_to_cpu_16(body->hdr.sequence_id_be);
-    uint8_t  buf[14 + PTP_DELAY_RESP_LEN];
+    uint8_t  buf[sizeof(struct ptp_eth_frame) + PTP_DELAY_RESP_LEN];
     build_delay_resp(buf, f, seq, t3, body->hdr.source_port_id);
-    if (ptp_tx_frame(f->dpdk_port, f->resp_vlan, buf, sizeof(buf)) == 0) {
+    if (ptp_tx_frame(f->dpdk_port, buf, sizeof(buf)) == 0) {
         st->resp_tx++;
     } else {
         st->tx_fail++;
@@ -424,8 +426,8 @@ static void rx_one_port(uint16_t port_id)
         struct rte_mbuf *m = bufs[i];
         uint64_t t_rx = now_real_ns();
 
-        /* Minimum: 14 ETH + 34 PTP header */
-        if (m->data_len < 14 + PTP_HDR_LEN) {
+        /* Minimum: ETH+VLAN (18B) + 34 PTP header */
+        if (m->data_len < sizeof(struct ptp_eth_frame) + PTP_HDR_LEN) {
             /* attribute to no flow — count as bad on first matching port flow */
             for (int k = 0; k < PTP_NUM_FLOWS; k++)
                 if (ptp_flows[k].dpdk_port == port_id) {
@@ -461,26 +463,24 @@ static void rx_one_port(uint16_t port_id)
                 }
             if (port_slot >= 0 && g_dbg_unmatched_left[port_slot] > 0) {
                 g_dbg_unmatched_left[port_slot]--;
-                uint16_t tci = (m->ol_flags & RTE_MBUF_F_RX_VLAN_STRIPPED)
-                                ? (m->vlan_tci & 0x0FFF) : 0xFFFF;
+                uint16_t vlan = rte_be_to_cpu_16(eth->vlan_tci_be) & 0x0FFF;
                 printf("[PTP-dbg] unmatched port=%u msg=0x%02x vl_id=%u "
                        "vlan=%u src_ne=0x%02x len=%u\n",
                        (unsigned)port_id, msg_type, vl_id,
-                       (unsigned)tci, src_ne, (unsigned)m->data_len);
+                       (unsigned)vlan, src_ne, (unsigned)m->data_len);
             }
             rte_pktmbuf_free(m);
             continue;
         }
         const struct ptp_flow *f = &ptp_flows[idx];
 
-        /* VLAN: HW strips on RX (mbuf->vlan_tci, ol_flags & RX_VLAN_STRIPPED).
-         * For PTP only, we tolerate a missing strip (some NICs may leave the
-         * tag inline) and skip the check rather than reject. */
-        if (m->ol_flags & RTE_MBUF_F_RX_VLAN_STRIPPED) {
+        /* VLAN is carried inline in the frame; read from packet bytes. */
+        {
+            uint16_t got_vlan = rte_be_to_cpu_16(eth->vlan_tci_be) & 0x0FFF;
             uint16_t want = (msg_type == PTP_MSG_SYNC)      ? f->sync_vlan
                           : (msg_type == PTP_MSG_DELAY_REQ) ? f->req_vlan
                           :                                   f->resp_vlan;
-            if ((m->vlan_tci & 0x0FFF) != (want & 0x0FFF)) {
+            if (got_vlan != (want & 0x0FFF)) {
                 g_state[idx].bad_vlan++;
                 rte_pktmbuf_free(m);
                 continue;
@@ -497,7 +497,7 @@ static void rx_one_port(uint16_t port_id)
 
         switch (msg_type) {
         case PTP_MSG_SYNC: {
-            if (m->data_len < 14 + PTP_SYNC_LEN) {
+            if (m->data_len < sizeof(*eth) + PTP_SYNC_LEN) {
                 g_state[idx].bad_size++;
                 break;
             }
@@ -507,7 +507,7 @@ static void rx_one_port(uint16_t port_id)
             break;
         }
         case PTP_MSG_DELAY_REQ: {
-            if (m->data_len < 14 + PTP_DELAY_REQ_LEN) {
+            if (m->data_len < sizeof(*eth) + PTP_DELAY_REQ_LEN) {
                 g_state[idx].bad_size++;
                 break;
             }
@@ -517,7 +517,7 @@ static void rx_one_port(uint16_t port_id)
             break;
         }
         case PTP_MSG_DELAY_RESP: {
-            if (m->data_len < 14 + PTP_DELAY_RESP_LEN) {
+            if (m->data_len < sizeof(*eth) + PTP_DELAY_RESP_LEN) {
                 g_state[idx].bad_size++;
                 break;
             }
@@ -565,9 +565,9 @@ static void *ptp_thread_fn(void *arg)
                 mono - st->last_sync_tx_mono_ns < 1000000000ULL) continue;
 
             uint64_t t1 = now_real_ns();
-            uint8_t  buf[14 + PTP_SYNC_LEN];
+            uint8_t  buf[sizeof(struct ptp_eth_frame) + PTP_SYNC_LEN];
             build_sync(buf, f, ++st->tx_seq, t1);
-            if (ptp_tx_frame(f->dpdk_port, f->sync_vlan, buf, sizeof(buf)) == 0) {
+            if (ptp_tx_frame(f->dpdk_port, buf, sizeof(buf)) == 0) {
                 st->sync_tx++;
                 st->last_sync_tx_mono_ns = mono;
             } else {
