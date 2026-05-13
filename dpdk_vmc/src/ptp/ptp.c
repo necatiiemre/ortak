@@ -91,6 +91,13 @@ struct ptp_state {
 
 static struct ptp_state g_state[PTP_NUM_FLOWS];
 
+/* Diagnostics — budget-capped logging of unexpected RX on the PTP queue, plus
+ * one-shot "first Sync seen" markers per flow. Helps diagnose silent ports
+ * (e.g. port 2 receiving no PTPv2 at all) without flooding the console. */
+#define PTP_DBG_UNMATCHED_BUDGET 8
+static uint32_t g_dbg_unmatched_left[PTP_NUM_FLOWS];   /* per port slot */
+static bool     g_dbg_first_sync_done[PTP_NUM_FLOWS];  /* per flow */
+
 /* ------------------------------------------------------------------ */
 /* Module-wide state                                                   */
 /* ------------------------------------------------------------------ */
@@ -309,8 +316,28 @@ static void handle_sync_rx(int flow_idx,
     st->last_sync_rx_mono_ns = mono_now;
     st->sync_stale           = false;
 
+    if (!g_dbg_first_sync_done[flow_idx]) {
+        g_dbg_first_sync_done[flow_idx] = true;
+        printf("[PTP-dbg] first Sync: flow=%d port=%u NE=%c vl_id=%u T1=%lu T2=%lu\n",
+               flow_idx, (unsigned)f->dpdk_port,
+               (f->ne == PTP_NE_A) ? 'A' : 'B',
+               f->sync_vl_id,
+               (unsigned long)st->last_t1_ns,
+               (unsigned long)t2_ns);
+    }
+
     /* In Slave mode, every Sync triggers a Delay_Req. */
     if (f->role == PTP_ROLE_M2_SLAVE) {
+        /* If a previous Delay_Req is still outstanding when a new Sync
+         * arrives, the master never answered it — count it as a timeout
+         * before we overwrite the timer. The worker-thread watchdog only
+         * fires when Sync stops; under steady 1 Hz traffic this path is
+         * what actually surfaces missing Delay_Resp. */
+        if (st->req_outstanding) {
+            st->resp_timeout++;
+            st->req_outstanding = false;
+        }
+
         uint64_t t3 = now_real_ns();
         uint8_t  buf[14 + PTP_DELAY_REQ_LEN];
         build_delay_req(buf, f, ++st->tx_seq, t3);
@@ -400,11 +427,22 @@ static void rx_one_port(uint16_t port_id)
             /* Steered to PTP queue but no flow matches — most likely unknown
              * VL-IDX or wrong msg type for this role. Account on the first
              * port flow as a generic bad_msg_type. */
+            int port_slot = -1;
             for (int k = 0; k < PTP_NUM_FLOWS; k++)
                 if (ptp_flows[k].dpdk_port == port_id) {
                     g_state[k].bad_msg_type++;
+                    if (port_slot < 0) port_slot = k;
                     break;
                 }
+            if (port_slot >= 0 && g_dbg_unmatched_left[port_slot] > 0) {
+                g_dbg_unmatched_left[port_slot]--;
+                uint16_t tci = (m->ol_flags & RTE_MBUF_F_RX_VLAN_STRIPPED)
+                                ? (m->vlan_tci & 0x0FFF) : 0xFFFF;
+                printf("[PTP-dbg] unmatched port=%u msg=0x%02x vl_id=%u "
+                       "vlan=%u src_ne=0x%02x len=%u\n",
+                       (unsigned)port_id, msg_type, vl_id,
+                       (unsigned)tci, src_ne, (unsigned)m->data_len);
+            }
             rte_pktmbuf_free(m);
             continue;
         }
@@ -483,6 +521,8 @@ static void *ptp_thread_fn(void *arg)
     (void)arg;
     g_ptp_running = true;
 
+    uint64_t next_stats_log_mono = now_mono_ns() + 5000000000ULL;
+
     while (!g_ptp_stop) {
         for (uint16_t i = 0; i < g_ptp_port_count; i++)
             rx_one_port(g_ptp_ports[i]);
@@ -501,6 +541,33 @@ static void *ptp_thread_fn(void *arg)
             if (st->last_sync_rx_mono_ns &&
                 mono - st->last_sync_rx_mono_ns > 3000000000ULL)
                 st->sync_stale = true;
+        }
+
+        /* Every 5 s, dump NIC-level stats for any PTP port that has not
+         * yet seen a single Sync. Lets us tell "switch isn't sending us
+         * anything" from "frames arrive but get misrouted". */
+        if (mono >= next_stats_log_mono) {
+            next_stats_log_mono = mono + 5000000000ULL;
+            for (uint16_t i = 0; i < g_ptp_port_count; i++) {
+                uint16_t port = g_ptp_ports[i];
+                bool any_sync = false;
+                for (int k = 0; k < PTP_NUM_FLOWS; k++)
+                    if (ptp_flows[k].dpdk_port == port &&
+                        g_state[k].sync_rx > 0) { any_sync = true; break; }
+                if (any_sync) continue;
+
+                struct rte_eth_stats es;
+                if (rte_eth_stats_get(port, &es) == 0) {
+                    printf("[PTP-dbg] silent port=%u ipkts=%lu imissed=%lu "
+                           "ierr=%lu rx_nombuf=%lu opkts=%lu\n",
+                           (unsigned)port,
+                           (unsigned long)es.ipackets,
+                           (unsigned long)es.imissed,
+                           (unsigned long)es.ierrors,
+                           (unsigned long)es.rx_nombuf,
+                           (unsigned long)es.opackets);
+                }
+            }
         }
 
         /* Light pacing — PTP is 1 Hz traffic, no need to spin. */
@@ -583,6 +650,9 @@ int ptp_flow_rules_install(uint16_t port_id)
 int ptp_init(void)
 {
     memset(g_state, 0, sizeof(g_state));
+    memset(g_dbg_first_sync_done, 0, sizeof(g_dbg_first_sync_done));
+    for (int i = 0; i < PTP_NUM_FLOWS; i++)
+        g_dbg_unmatched_left[i] = PTP_DBG_UNMATCHED_BUDGET;
 
     /* Build unique-port list (preserving order). */
     g_ptp_port_count = 0;
@@ -631,18 +701,34 @@ void ptp_stop(void)
 void ptp_print_dashboard(void)
 {
     printf("\n[PTP] role-aware 1588v2  (M1=Master, M2=Slave)\n");
-    printf("┌────┬──────┬────┬────┬──┬────────────────┬────────┬────────┬────────┬────────┬─────────┬────────────┐\n");
-    printf("│ #  │ Lbl  │ Pt │Role│NE│ VL-IDs S/Rq/Rs │ SyncRx │ ReqRx  │ RspTx  │ ReqTx  │ RspRx/TO│ T2-T1 (us) │\n");
-    printf("├────┼──────┼────┼────┼──┼────────────────┼────────┼────────┼────────┼────────┼─────────┼────────────┤\n");
+    printf("┌────┬──────┬────┬────┬──┬────────────────┬────────┬────────┬────────┬────────┬─────────┬────────────┬────────────┬────────────┬────────────┐\n");
+    printf("│ #  │ Lbl  │ Pt │Role│NE│ VL-IDs S/Rq/Rs │ SyncRx │ ReqRx  │ RspTx  │ ReqTx  │ RspRx/TO│ T2-T1 (us) │ T4-T3 (us) │ offset(us) │ delay (us) │\n");
+    printf("├────┼──────┼────┼────┼──┼────────────────┼────────┼────────┼────────┼────────┼─────────┼────────────┼────────────┼────────────┼────────────┤\n");
     for (int i = 0; i < PTP_NUM_FLOWS; i++) {
         const struct ptp_flow *f = &ptp_flows[i];
         const struct ptp_state *s = &g_state[i];
-        char role_c = (f->role == PTP_ROLE_M1_MASTER) ? 'M' : 'S';
+        /* Role tag is always "M<n>" — M1=Master, M2=Slave. */
         char ne_c   = (f->ne == PTP_NE_A) ? 'A' : 'B';
 
-        double dt_us = 0.0;
-        if (s->last_t1_ns && s->last_t2_ns)
-            dt_us = ((double)s->last_t2_ns - (double)s->last_t1_ns) / 1000.0;
+        /* Δ_sync = T2 - T1   (master → us)
+         * Δ_req  = T4 - T3   (us → master, or M1's RX of Unit's Delay_Req)
+         * offset = ((T2-T1) - (T4-T3)) / 2    (E2E PTP slave; cancels clock skew)
+         * delay  = ((T2-T1) + (T4-T3)) / 2    (mean path delay; clock-skew-free)
+         *
+         * For M1 (Master), the two legs are measured against DIFFERENT peers
+         * (Sync from ATE, Delay_Req from Unit), so offset/delay are mixed-peer
+         * curiosities; we still print them for cross-check. */
+        double dt_sync = 0.0, dt_req = 0.0, offs = 0.0, delay = 0.0;
+        bool have_sync = (s->last_t1_ns && s->last_t2_ns);
+        bool have_req  = (s->last_t3_ns && s->last_t4_ns);
+        if (have_sync)
+            dt_sync = ((double)s->last_t2_ns - (double)s->last_t1_ns) / 1000.0;
+        if (have_req)
+            dt_req  = ((double)s->last_t4_ns - (double)s->last_t3_ns) / 1000.0;
+        if (have_sync && have_req) {
+            offs  = (dt_sync - dt_req) / 2.0;
+            delay = (dt_sync + dt_req) / 2.0;
+        }
 
         char req_rx_s[12], req_tx_s[12], resp_tx_s[12], resp_rx_s[20];
         if (f->role == PTP_ROLE_M1_MASTER) {
@@ -658,17 +744,30 @@ void ptp_print_dashboard(void)
                      (unsigned long)s->resp_rx, (unsigned long)s->resp_timeout);
         }
 
-        printf("│ %2d │ %-4s │ %2u │ %c%c │%c │ %5u/%4u/%4u │ %6lu │ %6s │ %6s │ %6s │ %7s │ %+10.3f │\n",
-               i, f->j_label, (unsigned)f->dpdk_port, role_c,
+        char dt_sync_s[16], dt_req_s[16], offs_s[16], delay_s[16];
+        if (have_sync) snprintf(dt_sync_s, sizeof(dt_sync_s), "%+10.3f", dt_sync);
+        else           snprintf(dt_sync_s, sizeof(dt_sync_s), "%10s", "-");
+        if (have_req)  snprintf(dt_req_s,  sizeof(dt_req_s),  "%+10.3f", dt_req);
+        else           snprintf(dt_req_s,  sizeof(dt_req_s),  "%10s", "-");
+        if (have_sync && have_req) {
+            snprintf(offs_s,  sizeof(offs_s),  "%+10.3f", offs);
+            snprintf(delay_s, sizeof(delay_s), "%+10.3f", delay);
+        } else {
+            snprintf(offs_s,  sizeof(offs_s),  "%10s", "-");
+            snprintf(delay_s, sizeof(delay_s), "%10s", "-");
+        }
+
+        printf("│ %2d │ %-4s │ %2u │ M%c │%c │ %5u/%4u/%4u │ %6lu │ %6s │ %6s │ %6s │ %7s │ %s │ %s │ %s │ %s │\n",
+               i, f->j_label, (unsigned)f->dpdk_port,
                (f->role == PTP_ROLE_M1_MASTER) ? '1' : '2',
                ne_c,
                f->sync_vl_id, f->req_vl_id, f->resp_vl_id,
                (unsigned long)s->sync_rx,
                req_rx_s, resp_tx_s,
                req_tx_s, resp_rx_s,
-               dt_us);
+               dt_sync_s, dt_req_s, offs_s, delay_s);
     }
-    printf("└────┴──────┴────┴────┴──┴────────────────┴────────┴────────┴────────┴────────┴─────────┴────────────┘\n");
+    printf("└────┴──────┴────┴────┴──┴────────────────┴────────┴────────┴────────┴────────┴─────────┴────────────┴────────────┴────────────┴────────────┘\n");
 
     /* Bad counters + stale flags */
     uint64_t bv=0, bn=0, bs=0, bt=0, af=0, tf=0;
