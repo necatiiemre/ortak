@@ -184,6 +184,10 @@ static void fill_ptp_header(struct ptp_header *h,
     h->ver         = PTP_VERSION;                    /* reserved=0, ver=2  */
     h->length_be   = rte_cpu_to_be_16(length);
     h->domain      = domain;
+    /* Match the master's flagField (PTP_TIMESCALE bit in octet 0). The DTN
+     * switch sends 0x01xx on the wire; mirroring this in our outgoing
+     * Delay_Req/Delay_Resp keeps strict masters from dropping them. */
+    h->flags_be    = rte_cpu_to_be_16(0x0100);
     /* sourcePortIdentity: 8 bytes clockIdentity + 2 bytes portNumber.
      * Encode our local clockIdentity from the NE code so a wire capture is
      * self-describing. */
@@ -239,7 +243,7 @@ static void build_delay_resp(uint8_t *dst,
     struct ptp_msg_delay_resp body;
     memset(&body, 0, sizeof(body));
     fill_ptp_header(&body.hdr, PTP_MSG_DELAY_RESP,
-                    PTP_DELAY_RESP_LEN, /* domain */ 0,
+                    PTP_DELAY_RESP_LEN, /* domain */ 10,
                     sequence_id, /* control */ 0x03, f->ne);
     ptp_ns_to_ts(t3_ns, &body.receive_ts);
     if (requesting_port_id)
@@ -257,7 +261,7 @@ static void build_delay_req(uint8_t *dst,
     struct ptp_msg_sync body;
     memset(&body, 0, sizeof(body));
     fill_ptp_header(&body.hdr, PTP_MSG_DELAY_REQ,
-                    PTP_DELAY_REQ_LEN, /* domain */ 0,
+                    PTP_DELAY_REQ_LEN, /* domain */ 10,
                     sequence_id, /* control */ 0x01, f->ne);
     ptp_ns_to_ts(t3_ns, &body.origin_ts);
 
