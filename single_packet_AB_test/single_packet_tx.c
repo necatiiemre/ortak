@@ -62,9 +62,9 @@
 #define PTP_HDR_LEN        34
 #define PTP_SYNC_LEN       (PTP_HDR_LEN + 10)   /* 44 */
 #define PTP_DOMAIN         10
-#define PTP_FLAGS          0x0100               /* PTP_TIMESCALE */
+#define PTP_FLAGS          0x0102               /* alternateMaster | leap59 — peer master uyumu */
 #define PTP_CONTROL_SYNC   0x00
-#define PTP_LOG_MSG_INT    0x7F
+#define PTP_LOG_MSG_INT    0x00                 /* 1 Hz Sync → 2^0 = 1 s */
 
 #define ETH_HDR_LEN        14
 #define VLAN_HDR_LEN       4

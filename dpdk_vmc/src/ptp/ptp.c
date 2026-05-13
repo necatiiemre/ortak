@@ -187,10 +187,12 @@ static void fill_ptp_header(struct ptp_header *h,
     h->ver         = PTP_VERSION;                    /* reserved=0, ver=2  */
     h->length_be   = rte_cpu_to_be_16(length);
     h->domain      = domain;
-    /* Match the master's flagField (PTP_TIMESCALE bit in octet 0). The DTN
-     * switch sends 0x01xx on the wire; mirroring this in our outgoing
-     * Delay_Req/Delay_Resp keeps strict masters from dropping them. */
-    h->flags_be    = rte_cpu_to_be_16(0x0100);
+    /* Mirror the peer master's flagField. On the wire this is octet0=0x01
+     * (alternateMasterFlag), octet1=0x02 (leap59). The previous 0x0100 only
+     * set octet0 and left octet1=0; some strict M1 slaves reject Sync without
+     * the expected octet1 bits, which would explain why our Sync drew no
+     * Delay_Req. */
+    h->flags_be    = rte_cpu_to_be_16(0x0102);
     /* sourcePortIdentity: 8 bytes clockIdentity + 2 bytes portNumber.
      * Encode our local clockIdentity from the NE code so a wire capture is
      * self-describing. */
@@ -200,7 +202,9 @@ static void fill_ptp_header(struct ptp_header *h,
     h->source_port_id[9] = 0x01;
     h->sequence_id_be    = rte_cpu_to_be_16(sequence_id);
     h->control           = control;
-    h->log_msg_interval  = 0x7F;
+    /* 1 Hz Sync → logMsgInterval = 0 (2^0 = 1 s). 0x7F is a "not meaningful"
+     * sentinel that strict slaves treat as invalid and reject the message. */
+    h->log_msg_interval  = 0x00;
 }
 
 /* Build an Ethernet + 802.1Q + PTPv2 frame in `dst` of total length
