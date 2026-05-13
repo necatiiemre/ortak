@@ -1,0 +1,692 @@
+#define _GNU_SOURCE
+/* PTPv2 (IEEE 1588) over raw Ethernet — two mechanisms:
+ *   M1 (Master role) — passively timestamps Sync (ATE→VMC) and Delay_Req
+ *                      (Unit→VMC); answers Delay_Req with Delay_Resp.
+ *   M2 (Slave  role) — receives Sync (VMC→), emits Delay_Req on every Sync,
+ *                      timestamps Delay_Resp (VMC→).
+ *
+ * Both mechanisms share one dedicated RX queue and one dedicated TX queue per
+ * carrying NIC port (see PTP_RX_QUEUE_ID / PTP_TX_QUEUE_ID). EtherType=0x88F7
+ * is steered to the PTP RX queue via an rte_flow rule installed after port
+ * start. VLAN handling uses HW offload (mbuf->vlan_tci + RTE_MBUF_F_TX_VLAN /
+ * RTE_MBUF_F_RX_VLAN_STRIPPED): the Cumulus switch removes the tag in the
+ * Unit-bound direction and re-inserts it on the return path, so the DPDK side
+ * always sees / emits tagged frames at the NIC. */
+
+#include "ptp.h"
+#include "ptp_wire.h"
+#include "Port.h"
+#include "Config.h"
+
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <stdbool.h>
+#include <time.h>
+#include <pthread.h>
+#include <unistd.h>
+
+#include <rte_mbuf.h>
+#include <rte_ethdev.h>
+#include <rte_flow.h>
+#include <rte_mempool.h>
+#include <rte_byteorder.h>
+#include <rte_ether.h>
+
+/* ------------------------------------------------------------------ */
+/* Flow table                                                          */
+/* ------------------------------------------------------------------ */
+
+const struct ptp_flow ptp_flows[PTP_NUM_FLOWS] = {
+    /* Mechanism 1 — Master role (Port 2 carries both NEs) */
+    { PTP_ROLE_M1_MASTER, 2, PTP_NE_A, 100, 1500,  228, 1502,  100, 1504, "J4-4" },
+    { PTP_ROLE_M1_MASTER, 2, PTP_NE_B,  97, 1501,  225, 1503,   97, 1505, "J4-1" },
+
+    /* Mechanism 2 — Slave role (Port 1 = NE A via J7-4, Port 3 = NE B via J5-4) */
+    { PTP_ROLE_M2_SLAVE,  1, PTP_NE_A, 240, 1600,  112, 1602,  240, 1604, "J7-4" },
+    { PTP_ROLE_M2_SLAVE,  3, PTP_NE_B, 232, 1601,  104, 1603,  232, 1605, "J5-4" },
+};
+
+/* ------------------------------------------------------------------ */
+/* Per-flow runtime state                                              */
+/* ------------------------------------------------------------------ */
+
+struct ptp_state {
+    /* Last PTP timestamps captured (CLOCK_REALTIME ns). T1/T3 come from the
+     * peer's PTP payload; T2/T4 are our local capture (M1: T2 on Sync RX,
+     * T4 on Delay_Req RX; M2: T2 on Sync RX, T4 from Delay_Resp). */
+    uint64_t last_t1_ns;
+    uint64_t last_t2_ns;
+    uint64_t last_t3_ns;
+    uint64_t last_t4_ns;
+
+    /* M2 watchdog (MONOTONIC ns) */
+    uint64_t last_req_tx_mono_ns;
+    bool     req_outstanding;
+    uint64_t resp_timeout;
+
+    /* Counters — written only by the PTP thread, so plain uint64_t. */
+    uint64_t sync_rx;
+    uint64_t req_rx;        /* M1 only */
+    uint64_t resp_tx;       /* M1 only */
+    uint64_t req_tx;        /* M2 only */
+    uint64_t resp_rx;       /* M2 only */
+
+    uint64_t bad_vlan;
+    uint64_t bad_ne;
+    uint64_t bad_size;
+    uint64_t bad_msg_type;
+    uint64_t alloc_fail;
+    uint64_t tx_fail;
+
+    /* Sync staleness (MONOTONIC) */
+    uint64_t last_sync_rx_mono_ns;
+    bool     sync_stale;
+
+    /* PTPv2 sequence counters — independent per direction. We do not echo
+     * incoming sequence numbers (the user requested no per-message matching);
+     * the counter only serves as a unique sequenceId on the wire. */
+    uint16_t tx_seq;
+};
+
+static struct ptp_state g_state[PTP_NUM_FLOWS];
+
+/* ------------------------------------------------------------------ */
+/* Module-wide state                                                   */
+/* ------------------------------------------------------------------ */
+
+static struct rte_mempool *g_ptp_mempool = NULL;
+static pthread_t           g_ptp_thread;
+static volatile bool       g_ptp_running = false;
+static volatile bool       g_ptp_stop    = false;
+
+/* ------------------------------------------------------------------ */
+/* Time helpers                                                        */
+/* ------------------------------------------------------------------ */
+
+static inline uint64_t now_real_ns(void)
+{
+    struct timespec ts;
+    clock_gettime(CLOCK_REALTIME, &ts);
+    return (uint64_t)ts.tv_sec * 1000000000ULL + (uint64_t)ts.tv_nsec;
+}
+
+static inline uint64_t now_mono_ns(void)
+{
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    return (uint64_t)ts.tv_sec * 1000000000ULL + (uint64_t)ts.tv_nsec;
+}
+
+/* ------------------------------------------------------------------ */
+/* Flow lookups                                                        */
+/* ------------------------------------------------------------------ */
+
+bool ptp_port_has_flow(uint16_t port_id)
+{
+    for (int i = 0; i < PTP_NUM_FLOWS; i++) {
+        if (ptp_flows[i].dpdk_port == port_id)
+            return true;
+    }
+    return false;
+}
+
+/* Match incoming packet to a flow by (port, VL-IDX, msg_type).
+ * Returns flow index in [0, PTP_NUM_FLOWS) or -1 if no match. */
+static int lookup_flow(uint16_t port_id, uint16_t vl_id, uint8_t msg_type)
+{
+    for (int i = 0; i < PTP_NUM_FLOWS; i++) {
+        const struct ptp_flow *f = &ptp_flows[i];
+        if (f->dpdk_port != port_id) continue;
+
+        switch (msg_type) {
+        case PTP_MSG_SYNC:
+            if (f->sync_vl_id == vl_id) return i;
+            break;
+        case PTP_MSG_DELAY_REQ:
+            /* Only M1 receives Delay_Req. */
+            if (f->role == PTP_ROLE_M1_MASTER && f->req_vl_id == vl_id) return i;
+            break;
+        case PTP_MSG_DELAY_RESP:
+            /* Only M2 receives Delay_Resp. */
+            if (f->role == PTP_ROLE_M2_SLAVE && f->resp_vl_id == vl_id) return i;
+            break;
+        default:
+            break;
+        }
+    }
+    return -1;
+}
+
+/* ------------------------------------------------------------------ */
+/* Frame builders                                                      */
+/* ------------------------------------------------------------------ */
+
+/* Fill the PTPv2 common header. Caller must set messageLength, sequenceId,
+ * control, and the body that follows. */
+static void fill_ptp_header(struct ptp_header *h,
+                            uint8_t  msg_type,
+                            uint16_t length,
+                            uint8_t  domain,
+                            uint16_t sequence_id,
+                            uint8_t  control,
+                            uint8_t  ne)
+{
+    memset(h, 0, sizeof(*h));
+    h->ts_msg      = (uint8_t)(msg_type & 0x0F);     /* transportSpecific=0 */
+    h->ver         = PTP_VERSION;                    /* reserved=0, ver=2  */
+    h->length_be   = rte_cpu_to_be_16(length);
+    h->domain      = domain;
+    /* sourcePortIdentity: 8 bytes clockIdentity + 2 bytes portNumber.
+     * Encode our local clockIdentity from the NE code so a wire capture is
+     * self-describing. */
+    h->source_port_id[0] = 0x02;
+    h->source_port_id[7] = ne;
+    h->source_port_id[8] = 0x00;
+    h->source_port_id[9] = 0x01;
+    h->sequence_id_be    = rte_cpu_to_be_16(sequence_id);
+    h->control           = control;
+    h->log_msg_interval  = 0x7F;
+}
+
+/* Build an Ethernet+PTPv2 frame in `dst` of total length `body_len + 14`.
+ * VLAN tag is NOT embedded — caller sets mbuf->vlan_tci with TX offload.
+ * SRC MAC follows the existing PRBS convention (02:00:00:00:00:NE), the same
+ * encoding the Cumulus switch uses to identify the local network element. */
+static void build_eth_ptp(uint8_t      *dst,
+                          uint8_t       ne,
+                          uint16_t      dst_vl_id,
+                          const void   *ptp_body,
+                          uint16_t      body_len)
+{
+    struct ptp_eth_frame *eth = (struct ptp_eth_frame *)dst;
+
+    /* Destination MAC = 03:00:00:00 || vl_id (BE) */
+    eth->dst_mac[0] = 0x03;
+    eth->dst_mac[1] = 0x00;
+    eth->dst_mac[2] = 0x00;
+    eth->dst_mac[3] = 0x00;
+    eth->dst_mac[4] = (uint8_t)((dst_vl_id >> 8) & 0xFF);
+    eth->dst_mac[5] = (uint8_t)( dst_vl_id        & 0xFF);
+
+    eth->src_mac[0] = 0x02;
+    eth->src_mac[1] = 0x00;
+    eth->src_mac[2] = 0x00;
+    eth->src_mac[3] = 0x00;
+    eth->src_mac[4] = 0x00;
+    eth->src_mac[5] = ne;
+    eth->ether_type_be = rte_cpu_to_be_16(PTP_ETHERTYPE);
+    memcpy(dst + sizeof(*eth), ptp_body, body_len);
+}
+
+/* Build a Delay_Resp frame echoing T3 as receiveTimestamp.
+ * Per the user's spec (PTPv2 standard form): receiveTimestamp carries the
+ * master's RX time of the Delay_Req — which is T3 echoed back, allowing the
+ * slave to close the (T4-T3) leg. */
+static void build_delay_resp(uint8_t *dst,
+                             const struct ptp_flow *f,
+                             uint16_t sequence_id,
+                             uint64_t t3_ns,
+                             const uint8_t *requesting_port_id)
+{
+    struct ptp_msg_delay_resp body;
+    memset(&body, 0, sizeof(body));
+    fill_ptp_header(&body.hdr, PTP_MSG_DELAY_RESP,
+                    PTP_DELAY_RESP_LEN, /* domain */ 0,
+                    sequence_id, /* control */ 0x03, f->ne);
+    ptp_ns_to_ts(t3_ns, &body.receive_ts);
+    if (requesting_port_id)
+        memcpy(body.requesting_port_id, requesting_port_id, 10);
+
+    build_eth_ptp(dst, f->ne, f->resp_vl_id, &body, PTP_DELAY_RESP_LEN);
+}
+
+/* Build a Delay_Req frame carrying T3 in originTimestamp. */
+static void build_delay_req(uint8_t *dst,
+                            const struct ptp_flow *f,
+                            uint16_t sequence_id,
+                            uint64_t t3_ns)
+{
+    struct ptp_msg_sync body;
+    memset(&body, 0, sizeof(body));
+    fill_ptp_header(&body.hdr, PTP_MSG_DELAY_REQ,
+                    PTP_DELAY_REQ_LEN, /* domain */ 0,
+                    sequence_id, /* control */ 0x01, f->ne);
+    ptp_ns_to_ts(t3_ns, &body.origin_ts);
+
+    build_eth_ptp(dst, f->ne, f->req_vl_id, &body, PTP_DELAY_REQ_LEN);
+}
+
+/* Allocate a new mbuf, build the supplied frame body, set VLAN offload, and
+ * burst-TX on the dedicated PTP queue. Returns 0 on success. */
+static int ptp_tx_frame(uint16_t port_id,
+                        uint16_t vlan_tci,
+                        const void *frame,
+                        uint16_t frame_len)
+{
+    struct rte_mbuf *m = rte_pktmbuf_alloc(g_ptp_mempool);
+    if (!m) return -1;
+
+    /* Pad the wire frame up to 60 bytes (Ethernet min minus FCS, before VLAN
+     * tag insertion). Some NICs require this; cost is negligible. */
+    uint16_t out_len = frame_len < 60 ? 60 : frame_len;
+    uint8_t *out = (uint8_t *)rte_pktmbuf_append(m, out_len);
+    if (!out) {
+        rte_pktmbuf_free(m);
+        return -1;
+    }
+    memcpy(out, frame, frame_len);
+    if (out_len > frame_len)
+        memset(out + frame_len, 0, out_len - frame_len);
+
+    m->vlan_tci  = vlan_tci;
+    m->ol_flags |= RTE_MBUF_F_TX_VLAN;
+    m->l2_len    = sizeof(struct ptp_eth_frame);
+
+    uint16_t sent = rte_eth_tx_burst(port_id, PTP_TX_QUEUE_ID, &m, 1);
+    if (sent != 1) {
+        rte_pktmbuf_free(m);
+        return -1;
+    }
+    return 0;
+}
+
+/* ------------------------------------------------------------------ */
+/* RX dispatch                                                         */
+/* ------------------------------------------------------------------ */
+
+static void handle_sync_rx(int flow_idx,
+                           const struct ptp_msg_sync *body,
+                           uint64_t t2_ns,
+                           uint64_t mono_now)
+{
+    struct ptp_state *st = &g_state[flow_idx];
+    const struct ptp_flow *f = &ptp_flows[flow_idx];
+
+    st->last_t1_ns           = ptp_ts_to_ns(&body->origin_ts);
+    st->last_t2_ns           = t2_ns;
+    st->sync_rx++;
+    st->last_sync_rx_mono_ns = mono_now;
+    st->sync_stale           = false;
+
+    /* In Slave mode, every Sync triggers a Delay_Req. */
+    if (f->role == PTP_ROLE_M2_SLAVE) {
+        uint64_t t3 = now_real_ns();
+        uint8_t  buf[14 + PTP_DELAY_REQ_LEN];
+        build_delay_req(buf, f, ++st->tx_seq, t3);
+        if (ptp_tx_frame(f->dpdk_port, f->req_vlan, buf, sizeof(buf)) == 0) {
+            st->last_t3_ns           = t3;
+            st->req_tx++;
+            st->last_req_tx_mono_ns  = mono_now;
+            st->req_outstanding      = true;
+        } else {
+            st->tx_fail++;
+        }
+    }
+}
+
+static void handle_request_rx(int flow_idx,
+                              const struct ptp_msg_sync *body,
+                              uint64_t t4_ns)
+{
+    struct ptp_state *st = &g_state[flow_idx];
+    const struct ptp_flow *f = &ptp_flows[flow_idx];
+
+    uint64_t t3 = ptp_ts_to_ns(&body->origin_ts);
+    st->last_t3_ns = t3;
+    st->last_t4_ns = t4_ns;
+    st->req_rx++;
+
+    uint16_t seq = rte_be_to_cpu_16(body->hdr.sequence_id_be);
+    uint8_t  buf[14 + PTP_DELAY_RESP_LEN];
+    build_delay_resp(buf, f, seq, t3, body->hdr.source_port_id);
+    if (ptp_tx_frame(f->dpdk_port, f->resp_vlan, buf, sizeof(buf)) == 0) {
+        st->resp_tx++;
+    } else {
+        st->tx_fail++;
+    }
+}
+
+static void handle_response_rx(int flow_idx,
+                               const struct ptp_msg_delay_resp *body)
+{
+    struct ptp_state *st = &g_state[flow_idx];
+
+    /* T4 = master's RX timestamp of our Delay_Req (echoed in receiveTimestamp).
+     * The user requested no sequenceId matching, so we just close the most
+     * recent outstanding request. */
+    st->last_t4_ns = ptp_ts_to_ns(&body->receive_ts);
+    st->resp_rx++;
+    st->req_outstanding = false;
+}
+
+static void rx_one_port(uint16_t port_id)
+{
+    struct rte_mbuf *bufs[32];
+    uint16_t n = rte_eth_rx_burst(port_id, PTP_RX_QUEUE_ID, bufs, 32);
+    if (!n) return;
+
+    uint64_t mono_now = now_mono_ns();
+
+    for (uint16_t i = 0; i < n; i++) {
+        struct rte_mbuf *m = bufs[i];
+        uint64_t t_rx = now_real_ns();
+
+        /* Minimum: 14 ETH + 34 PTP header */
+        if (m->data_len < 14 + PTP_HDR_LEN) {
+            /* attribute to no flow — count as bad on first matching port flow */
+            for (int k = 0; k < PTP_NUM_FLOWS; k++)
+                if (ptp_flows[k].dpdk_port == port_id) {
+                    g_state[k].bad_size++;
+                    break;
+                }
+            rte_pktmbuf_free(m);
+            continue;
+        }
+
+        const uint8_t *p = rte_pktmbuf_mtod(m, const uint8_t *);
+        const struct ptp_eth_frame *eth = (const struct ptp_eth_frame *)p;
+
+        /* Dest MAC bytes 4..5 = VL-IDX (big-endian) */
+        uint16_t vl_id   = ((uint16_t)eth->dst_mac[4] << 8) | eth->dst_mac[5];
+        uint8_t  src_ne  = eth->src_mac[5];
+
+        const struct ptp_header *hdr =
+            (const struct ptp_header *)(p + sizeof(*eth));
+        uint8_t msg_type = hdr->ts_msg & 0x0F;
+
+        int idx = lookup_flow(port_id, vl_id, msg_type);
+        if (idx < 0) {
+            /* Steered to PTP queue but no flow matches — most likely unknown
+             * VL-IDX or wrong msg type for this role. Account on the first
+             * port flow as a generic bad_msg_type. */
+            for (int k = 0; k < PTP_NUM_FLOWS; k++)
+                if (ptp_flows[k].dpdk_port == port_id) {
+                    g_state[k].bad_msg_type++;
+                    break;
+                }
+            rte_pktmbuf_free(m);
+            continue;
+        }
+        const struct ptp_flow *f = &ptp_flows[idx];
+
+        /* VLAN: HW strips on RX (mbuf->vlan_tci, ol_flags & RX_VLAN_STRIPPED).
+         * For PTP only, we tolerate a missing strip (some NICs may leave the
+         * tag inline) and skip the check rather than reject. */
+        if (m->ol_flags & RTE_MBUF_F_RX_VLAN_STRIPPED) {
+            uint16_t want = (msg_type == PTP_MSG_SYNC)      ? f->sync_vlan
+                          : (msg_type == PTP_MSG_DELAY_REQ) ? f->req_vlan
+                          :                                   f->resp_vlan;
+            if ((m->vlan_tci & 0x0FFF) != (want & 0x0FFF)) {
+                g_state[idx].bad_vlan++;
+                rte_pktmbuf_free(m);
+                continue;
+            }
+        }
+
+        /* For Sync (M1 + M2), validate NE byte. Other directions originate
+         * from the Unit/VMC and their src MAC convention differs. */
+        if (msg_type == PTP_MSG_SYNC && src_ne != f->ne) {
+            g_state[idx].bad_ne++;
+            rte_pktmbuf_free(m);
+            continue;
+        }
+
+        switch (msg_type) {
+        case PTP_MSG_SYNC: {
+            if (m->data_len < 14 + PTP_SYNC_LEN) {
+                g_state[idx].bad_size++;
+                break;
+            }
+            const struct ptp_msg_sync *body =
+                (const struct ptp_msg_sync *)(p + sizeof(*eth));
+            handle_sync_rx(idx, body, t_rx, mono_now);
+            break;
+        }
+        case PTP_MSG_DELAY_REQ: {
+            if (m->data_len < 14 + PTP_DELAY_REQ_LEN) {
+                g_state[idx].bad_size++;
+                break;
+            }
+            const struct ptp_msg_sync *body =
+                (const struct ptp_msg_sync *)(p + sizeof(*eth));
+            handle_request_rx(idx, body, t_rx);
+            break;
+        }
+        case PTP_MSG_DELAY_RESP: {
+            if (m->data_len < 14 + PTP_DELAY_RESP_LEN) {
+                g_state[idx].bad_size++;
+                break;
+            }
+            const struct ptp_msg_delay_resp *body =
+                (const struct ptp_msg_delay_resp *)(p + sizeof(*eth));
+            handle_response_rx(idx, body);
+            break;
+        }
+        default:
+            g_state[idx].bad_msg_type++;
+            break;
+        }
+        rte_pktmbuf_free(m);
+    }
+}
+
+/* ------------------------------------------------------------------ */
+/* Worker thread                                                       */
+/* ------------------------------------------------------------------ */
+
+static uint16_t g_ptp_ports[PTP_NUM_FLOWS];
+static uint16_t g_ptp_port_count = 0;
+
+static void *ptp_thread_fn(void *arg)
+{
+    (void)arg;
+    g_ptp_running = true;
+
+    while (!g_ptp_stop) {
+        for (uint16_t i = 0; i < g_ptp_port_count; i++)
+            rx_one_port(g_ptp_ports[i]);
+
+        /* Watchdog: any outstanding Delay_Req older than 1 s without a
+         * matching Delay_Resp counts as a timeout and is cleared. */
+        uint64_t mono = now_mono_ns();
+        for (int k = 0; k < PTP_NUM_FLOWS; k++) {
+            struct ptp_state *st = &g_state[k];
+            if (ptp_flows[k].role == PTP_ROLE_M2_SLAVE &&
+                st->req_outstanding &&
+                mono - st->last_req_tx_mono_ns > 1000000000ULL) {
+                st->resp_timeout++;
+                st->req_outstanding = false;
+            }
+            if (st->last_sync_rx_mono_ns &&
+                mono - st->last_sync_rx_mono_ns > 3000000000ULL)
+                st->sync_stale = true;
+        }
+
+        /* Light pacing — PTP is 1 Hz traffic, no need to spin. */
+        struct timespec ts = { 0, 200000 };  /* 0.2 ms */
+        nanosleep(&ts, NULL);
+    }
+
+    g_ptp_running = false;
+    return NULL;
+}
+
+/* ------------------------------------------------------------------ */
+/* rte_flow rule install                                               */
+/* ------------------------------------------------------------------ */
+
+int ptp_flow_rules_install(uint16_t port_id)
+{
+    if (!ptp_port_has_flow(port_id)) return 0;
+
+    struct rte_flow_error err = {0};
+    struct rte_flow_attr attr = {0};
+    struct rte_flow_item pattern[4];
+    struct rte_flow_action action[2];
+    struct rte_flow_item_eth   eth_spec, eth_mask;
+    struct rte_flow_item_vlan  vlan_spec, vlan_mask;
+    struct rte_flow_action_queue qa;
+
+    attr.ingress  = 1;
+    attr.priority = 0;            /* Higher priority than PRBS rules (1). */
+
+    memset(&eth_spec,  0, sizeof(eth_spec));
+    memset(&eth_mask,  0, sizeof(eth_mask));
+    memset(&vlan_spec, 0, sizeof(vlan_spec));
+    memset(&vlan_mask, 0, sizeof(vlan_mask));
+    memset(pattern,    0, sizeof(pattern));
+    memset(action,     0, sizeof(action));
+
+    /* Match: ETH (any) → VLAN (any, inner_type=0x88F7) → END. */
+    vlan_spec.inner_type = rte_cpu_to_be_16(PTP_ETHERTYPE);
+    vlan_mask.inner_type = rte_cpu_to_be_16(0xFFFF);
+
+    pattern[0].type = RTE_FLOW_ITEM_TYPE_ETH;
+    pattern[0].spec = &eth_spec;
+    pattern[0].mask = &eth_mask;
+
+    pattern[1].type = RTE_FLOW_ITEM_TYPE_VLAN;
+    pattern[1].spec = &vlan_spec;
+    pattern[1].mask = &vlan_mask;
+
+    pattern[2].type = RTE_FLOW_ITEM_TYPE_END;
+
+    qa.index = PTP_RX_QUEUE_ID;
+    action[0].type = RTE_FLOW_ACTION_TYPE_QUEUE;
+    action[0].conf = &qa;
+    action[1].type = RTE_FLOW_ACTION_TYPE_END;
+
+    int ret = rte_flow_validate(port_id, &attr, pattern, action, &err);
+    if (ret != 0) {
+        printf("PTP Flow: Port %u validate failed: %s\n",
+               port_id, err.message ? err.message : "unknown");
+        return -1;
+    }
+
+    struct rte_flow *flow = rte_flow_create(port_id, &attr, pattern, action, &err);
+    if (!flow) {
+        printf("PTP Flow: Port %u create failed: %s\n",
+               port_id, err.message ? err.message : "unknown");
+        return -1;
+    }
+
+    printf("PTP Flow: Port %u EtherType=0x88F7 -> Queue %u\n",
+           port_id, (unsigned)PTP_RX_QUEUE_ID);
+    return 0;
+}
+
+/* ------------------------------------------------------------------ */
+/* Init / stop / dashboard                                             */
+/* ------------------------------------------------------------------ */
+
+int ptp_init(void)
+{
+    memset(g_state, 0, sizeof(g_state));
+
+    /* Build unique-port list (preserving order). */
+    g_ptp_port_count = 0;
+    for (int i = 0; i < PTP_NUM_FLOWS; i++) {
+        uint16_t p = ptp_flows[i].dpdk_port;
+        bool seen = false;
+        for (uint16_t k = 0; k < g_ptp_port_count; k++)
+            if (g_ptp_ports[k] == p) { seen = true; break; }
+        if (!seen) g_ptp_ports[g_ptp_port_count++] = p;
+    }
+
+    /* Create the PTP mempool on the socket of the first PTP port. */
+    int socket_id = rte_eth_dev_socket_id(g_ptp_ports[0]);
+    if (socket_id < 0) socket_id = 0;
+
+    g_ptp_mempool = rte_pktmbuf_pool_create(
+        "ptp_pool", 4096, 256, 0, RTE_MBUF_DEFAULT_BUF_SIZE,
+        (unsigned)socket_id);
+    if (!g_ptp_mempool) {
+        printf("PTP: failed to create mempool\n");
+        return -1;
+    }
+
+    g_ptp_stop = false;
+    int rc = pthread_create(&g_ptp_thread, NULL, ptp_thread_fn, NULL);
+    if (rc != 0) {
+        printf("PTP: pthread_create failed: %d\n", rc);
+        return -1;
+    }
+    pthread_setname_np(g_ptp_thread, "ptp-worker");
+
+    printf("PTP: %u flows on %u port(s), RXQ=%u TXQ=%u\n",
+           (unsigned)PTP_NUM_FLOWS, (unsigned)g_ptp_port_count,
+           (unsigned)PTP_RX_QUEUE_ID, (unsigned)PTP_TX_QUEUE_ID);
+    return 0;
+}
+
+void ptp_stop(void)
+{
+    if (!g_ptp_running && !g_ptp_thread) return;
+    g_ptp_stop = true;
+    pthread_join(g_ptp_thread, NULL);
+    g_ptp_thread = 0;
+}
+
+void ptp_print_dashboard(void)
+{
+    printf("\n[PTP] role-aware 1588v2  (M1=Master, M2=Slave)\n");
+    printf("┌────┬──────┬────┬────┬──┬────────────────┬────────┬────────┬────────┬────────┬─────────┬────────────┐\n");
+    printf("│ #  │ Lbl  │ Pt │Role│NE│ VL-IDs S/Rq/Rs │ SyncRx │ ReqRx  │ RspTx  │ ReqTx  │ RspRx/TO│ T2-T1 (us) │\n");
+    printf("├────┼──────┼────┼────┼──┼────────────────┼────────┼────────┼────────┼────────┼─────────┼────────────┤\n");
+    for (int i = 0; i < PTP_NUM_FLOWS; i++) {
+        const struct ptp_flow *f = &ptp_flows[i];
+        const struct ptp_state *s = &g_state[i];
+        char role_c = (f->role == PTP_ROLE_M1_MASTER) ? 'M' : 'S';
+        char ne_c   = (f->ne == PTP_NE_A) ? 'A' : 'B';
+
+        double dt_us = 0.0;
+        if (s->last_t1_ns && s->last_t2_ns)
+            dt_us = ((double)s->last_t2_ns - (double)s->last_t1_ns) / 1000.0;
+
+        char req_rx_s[12], req_tx_s[12], resp_tx_s[12], resp_rx_s[20];
+        if (f->role == PTP_ROLE_M1_MASTER) {
+            snprintf(req_rx_s,  sizeof(req_rx_s),  "%lu", (unsigned long)s->req_rx);
+            snprintf(resp_tx_s, sizeof(resp_tx_s), "%lu", (unsigned long)s->resp_tx);
+            snprintf(req_tx_s,  sizeof(req_tx_s),  "%s", "-");
+            snprintf(resp_rx_s, sizeof(resp_rx_s), "%s", "-");
+        } else {
+            snprintf(req_rx_s,  sizeof(req_rx_s),  "%s", "-");
+            snprintf(resp_tx_s, sizeof(resp_tx_s), "%s", "-");
+            snprintf(req_tx_s,  sizeof(req_tx_s),  "%lu", (unsigned long)s->req_tx);
+            snprintf(resp_rx_s, sizeof(resp_rx_s), "%lu/%lu",
+                     (unsigned long)s->resp_rx, (unsigned long)s->resp_timeout);
+        }
+
+        printf("│ %2d │ %-4s │ %2u │ %c%c │%c │ %5u/%4u/%4u │ %6lu │ %6s │ %6s │ %6s │ %7s │ %+10.3f │\n",
+               i, f->j_label, (unsigned)f->dpdk_port, role_c,
+               (f->role == PTP_ROLE_M1_MASTER) ? '1' : '2',
+               ne_c,
+               f->sync_vl_id, f->req_vl_id, f->resp_vl_id,
+               (unsigned long)s->sync_rx,
+               req_rx_s, resp_tx_s,
+               req_tx_s, resp_rx_s,
+               dt_us);
+    }
+    printf("└────┴──────┴────┴────┴──┴────────────────┴────────┴────────┴────────┴────────┴─────────┴────────────┘\n");
+
+    /* Bad counters + stale flags */
+    uint64_t bv=0, bn=0, bs=0, bt=0, af=0, tf=0;
+    int stale_a=0, stale_b=0;
+    for (int i = 0; i < PTP_NUM_FLOWS; i++) {
+        bv += g_state[i].bad_vlan;
+        bn += g_state[i].bad_ne;
+        bs += g_state[i].bad_size;
+        bt += g_state[i].bad_msg_type;
+        af += g_state[i].alloc_fail;
+        tf += g_state[i].tx_fail;
+        if (g_state[i].sync_stale) {
+            if (ptp_flows[i].ne == PTP_NE_A) stale_a = 1;
+            else stale_b = 1;
+        }
+    }
+    printf("[PTP] bad vlan=%lu ne=%lu size=%lu type=%lu | alloc_fail=%lu tx_fail=%lu | stale: A=%s B=%s\n",
+           (unsigned long)bv, (unsigned long)bn, (unsigned long)bs,
+           (unsigned long)bt, (unsigned long)af, (unsigned long)tf,
+           stale_a ? "yes" : "no", stale_b ? "yes" : "no");
+}
