@@ -36,17 +36,25 @@
 #define PTP_FRAME_NOVLAN_LEN   120                  /* eth + 88F7 + body */
 #define PTP_FRAME_VLAN_LEN     124                  /* +4 byte 802.1Q */
 
-/* PTP_DATA blob (35 bytes), strict-checked by the peer slave. The peer
- * master emits exactly these bytes in every Sync/Req/Resp frame; we mirror
- * them verbatim — flow distinction comes from src MAC NE byte and dst MAC
- * VL-ID, not from anything inside the blob. */
+/* PTP_DATA blobs (35 bytes each), strict-checked by the peer side. Wire
+ * captures show that master and slave use distinct blobs — they differ in
+ * the domain byte, the ASCII identifier, and the trailing 5 bytes. The
+ * receiving side appears to verify the blob byte-for-byte, so a Sync that
+ * carries the slave blob (or vice versa) gets dropped silently. */
 #define PTP_DATA_LEN           35
-static const uint8_t PTP_DATA_BLOB[PTP_DATA_LEN] = {
+static const uint8_t PTP_DATA_MASTER_BLOB[PTP_DATA_LEN] = {
     0x02, 0x00, 0x6a, 0x0b, 0x00, 0x01, 0x02, 0x00,
     0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
     0x00, 0x00, 0x00, 0x6d, 0x61, 0x73, 0x74, 0x65,
     0x72, 0x64, 0x65, 0x76, 0x2e, 0x00, 0x02, 0x00,
     0x00, 0x00, 0x00
+};
+static const uint8_t PTP_DATA_SLAVE_BLOB[PTP_DATA_LEN] = {
+    0x02, 0x00, 0x6a, 0x0a, 0x00, 0x01, 0x02, 0x00,
+    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+    0x00, 0x00, 0x00, 0x73, 0x6c, 0x61, 0x76, 0x65,
+    0x5f, 0x64, 0x65, 0x76, 0x2e, 0x00, 0x01, 0x01,
+    0xff, 0x12, 0x13
 };
 
 /* Offsets within the PTP body (i.e. after eth + 802.1Q + 88F7 prefix). */

@@ -180,13 +180,14 @@ static int lookup_flow(uint16_t port_id, uint16_t vl_id, uint8_t msg_type)
  * dst must have room for PTP_FRAME_VLAN_LEN (124) bytes; helper zero-fills
  * the entire frame before writing fields so the spec's 53-byte trailing
  * pad and the 0x00 filler at PTP_BODY_FILLER_OFF stay zero by default. */
-static void build_proprietary_frame(uint8_t *dst,
-                                    uint8_t  ne,
-                                    uint16_t vlan_id,
-                                    uint16_t dst_vl_id,
-                                    uint8_t  msg_type,
-                                    uint64_t time1_ns,
-                                    uint64_t time2_ns)
+static void build_proprietary_frame(uint8_t       *dst,
+                                    uint8_t        ne,
+                                    uint16_t       vlan_id,
+                                    uint16_t       dst_vl_id,
+                                    uint8_t        msg_type,
+                                    const uint8_t *data_blob,
+                                    uint64_t       time1_ns,
+                                    uint64_t       time2_ns)
 {
     memset(dst, 0, PTP_FRAME_VLAN_LEN);
 
@@ -206,40 +207,43 @@ static void build_proprietary_frame(uint8_t *dst,
     uint8_t *body = dst + sizeof(*eth);
 
     body[PTP_BODY_MSG_TYPE_OFF] = msg_type;
-    memcpy(body + PTP_BODY_DATA_OFF, PTP_DATA_BLOB, PTP_DATA_LEN);
+    memcpy(body + PTP_BODY_DATA_OFF, data_blob, PTP_DATA_LEN);
     ptp_write_time(body + PTP_BODY_TIME1_OFF, time1_ns);
     /* PTP_BODY_FILLER_OFF stays 0x00 from memset */
     ptp_write_time(body + PTP_BODY_TIME2_OFF, time2_ns);
     /* PTP_BODY_PAD_OFF..end already zero */
 }
 
-/* Sync (Master → Slave): T1 in PTP_TIME_1, PTP_TIME_2 unused. */
+/* Sync (we are Master): master blob, T1 in PTP_TIME_1. */
 static void build_sync(uint8_t *dst,
                        const struct ptp_flow *f,
                        uint64_t t1_ns)
 {
     build_proprietary_frame(dst, f->ne, f->sync_vlan, f->sync_vl_id,
-                            PTP_MSG_SYNC, t1_ns, /* time2 */ 0);
+                            PTP_MSG_SYNC, PTP_DATA_MASTER_BLOB,
+                            t1_ns, /* time2 */ 0);
 }
 
-/* Delay_Req (Slave → Master): T3 in PTP_TIME_1, PTP_TIME_2 unused. */
+/* Delay_Req (we are Slave): slave blob, T3 in PTP_TIME_1. */
 static void build_delay_req(uint8_t *dst,
                             const struct ptp_flow *f,
                             uint64_t t3_ns)
 {
     build_proprietary_frame(dst, f->ne, f->req_vlan, f->req_vl_id,
-                            PTP_MSG_DELAY_REQ, t3_ns, /* time2 */ 0);
+                            PTP_MSG_DELAY_REQ, PTP_DATA_SLAVE_BLOB,
+                            t3_ns, /* time2 */ 0);
 }
 
-/* Delay_Resp (Master → Slave): master's RX time of the Delay_Req goes in
- * PTP_TIME_1, allowing the slave to close the (T4-T3) leg. PTP_TIME_2
- * unused for now. */
+/* Delay_Resp (we are Master answering a slave's Delay_Req): master blob,
+ * our local RX time of the Delay_Req goes in PTP_TIME_1 so the slave can
+ * close the (T4-T3) leg. */
 static void build_delay_resp(uint8_t *dst,
                              const struct ptp_flow *f,
                              uint64_t master_rx_ns)
 {
     build_proprietary_frame(dst, f->ne, f->resp_vlan, f->resp_vl_id,
-                            PTP_MSG_DELAY_RESP, master_rx_ns, /* time2 */ 0);
+                            PTP_MSG_DELAY_RESP, PTP_DATA_MASTER_BLOB,
+                            master_rx_ns, /* time2 */ 0);
 }
 
 /* Allocate a new mbuf, copy the supplied wire frame, pad to Ethernet min and

@@ -78,13 +78,22 @@
 #define BODY_FILLER_OFF      (BODY_TIME1_OFF + 8)                         /* 44 */
 #define BODY_TIME2_OFF       (BODY_FILLER_OFF + 1)                        /* 45 */
 
-/* Sabit PTP_DATA blob — saha spec'inde verildigi gibi 35 byte. */
-static const uint8_t PTP_DATA_BLOB[PTP_DATA_LEN] = {
+/* PTP_DATA blob'lari — master ve slave farkli 35-byte sabit blob kullaniyor.
+ * Wire capture'lara gore karsi taraf bu byte'lari strict check ediyor; Sync
+ * gonderirken master blob, Delay_Req gonderirken slave blob lazim. */
+static const uint8_t PTP_DATA_MASTER_BLOB[PTP_DATA_LEN] = {
     0x02, 0x00, 0x6a, 0x0b, 0x00, 0x01, 0x02, 0x00,
     0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
     0x00, 0x00, 0x00, 0x6d, 0x61, 0x73, 0x74, 0x65,
     0x72, 0x64, 0x65, 0x76, 0x2e, 0x00, 0x02, 0x00,
     0x00, 0x00, 0x00
+};
+static const uint8_t PTP_DATA_SLAVE_BLOB[PTP_DATA_LEN] __attribute__((unused)) = {
+    0x02, 0x00, 0x6a, 0x0a, 0x00, 0x01, 0x02, 0x00,
+    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+    0x00, 0x00, 0x00, 0x73, 0x6c, 0x61, 0x76, 0x65,
+    0x5f, 0x64, 0x65, 0x76, 0x2e, 0x00, 0x01, 0x01,
+    0xff, 0x12, 0x13
 };
 
 /* ========================================== */
@@ -117,6 +126,7 @@ static void build_packet(uint8_t *pkt,
                          uint16_t vl_id,
                          const uint8_t *src_mac,
                          uint8_t msg_type,
+                         const uint8_t *data_blob,
                          uint64_t time1_ns,
                          uint64_t time2_ns)
 {
@@ -141,7 +151,7 @@ static void build_packet(uint8_t *pkt,
     /* --- Proprietary PTP body (106 B), eth+vlan sonrasi offset 18 --- */
     uint8_t *body = pkt + 18;
     body[BODY_MSG_TYPE_OFF] = msg_type;
-    memcpy(body + BODY_DATA_OFF, PTP_DATA_BLOB, PTP_DATA_LEN);
+    memcpy(body + BODY_DATA_OFF, data_blob, PTP_DATA_LEN);
     write_ptp_time(body + BODY_TIME1_OFF, time1_ns);
     /* BODY_FILLER_OFF zaten 0x00 (memset) */
     write_ptp_time(body + BODY_TIME2_OFF, time2_ns);
@@ -219,8 +229,10 @@ int main(void)
 
     while (1) {
         uint64_t t1 = now_real_ns();
-        build_packet(pkt_a, VLAN_ID_A, VL_ID_A, src_mac_a, PTP_MSG_SYNC, t1, 0);
-        build_packet(pkt_b, VLAN_ID_B, VL_ID_B, src_mac_b, PTP_MSG_SYNC, t1, 0);
+        build_packet(pkt_a, VLAN_ID_A, VL_ID_A, src_mac_a, PTP_MSG_SYNC,
+                     PTP_DATA_MASTER_BLOB, t1, 0);
+        build_packet(pkt_b, VLAN_ID_B, VL_ID_B, src_mac_b, PTP_MSG_SYNC,
+                     PTP_DATA_MASTER_BLOB, t1, 0);
 
         trace_packet(pkt_a, t1, "TX-A");
         trace_packet(pkt_b, t1, "TX-B");
