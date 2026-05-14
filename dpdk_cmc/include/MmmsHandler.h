@@ -43,6 +43,13 @@ extern "C" {
 
 #define MMMS_FIRST_PACKET_TIMEOUT_S 60
 
+/*
+ * Mirror Common.h's stop_normal_tx symbol here so translation units that
+ * pull MmmsHandler.h (notably TxRxManager.c, which does not include
+ * Common.h) can reference the flag without an extra include.
+ */
+extern volatile bool stop_normal_tx;
+
 /* Forward declarations (DPDK types kept opaque for header simplicity). */
 struct ports_config;
 
