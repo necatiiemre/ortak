@@ -359,6 +359,41 @@ bool SSHDeployer::fetchFile(const std::string& remote_path, const std::string& l
     }
 }
 
+bool SSHDeployer::fetchDirectory(const std::string& remote_path, const std::string& local_path) {
+    DEBUG_LOG(getLogPrefix() << " Fetching directory " << remote_path << " -> " << local_path);
+
+    // Ensure the local destination directory exists.
+    if (!std::filesystem::exists(local_path)) {
+        std::filesystem::create_directories(local_path);
+        DEBUG_LOG(getLogPrefix() << " Created local directory: " << local_path);
+    }
+
+    // scp -r copies the remote directory itself into the local destination.
+    // Appending /. on the source pulls the contents instead, which is what
+    // callers usually want when local_path is already the target dir.
+    std::string remote_spec = remote_path;
+    if (!remote_spec.empty() && remote_spec.back() == '/') {
+        remote_spec.pop_back();
+    }
+    remote_spec += "/.";
+
+    std::string scp_cmd = "sshpass -p '" + m_password + "' "
+                          "scp -r -o StrictHostKeyChecking=no "
+                          "-o ConnectTimeout=30 "
+                          + m_username + "@" + m_host + ":" + remote_spec + " "
+                          + local_path;
+
+    auto result = g_systemCommand.execute(scp_cmd);
+
+    if (result.success) {
+        DEBUG_LOG(getLogPrefix() << " Directory fetched successfully!");
+        return true;
+    } else {
+        std::cerr << getLogPrefix() << " Directory fetch failed: " << result.error << std::endl;
+        return false;
+    }
+}
+
 bool SSHDeployer::deployBuildRunAndFetchLog(const std::string& local_source_dir,
                                              const std::string& app_name,
                                              const std::string& run_args,

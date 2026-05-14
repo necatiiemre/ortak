@@ -3,6 +3,12 @@
 
 static volatile bool force_quit = false;
 
+// MMMS shutdown phase flag. Set by the SIGINT handler on the first Ctrl+C to
+// halt normal TX while keeping RX alive long enough to drain the MMMS file
+// transfer. A real (non-static) symbol so tx_worker and main loop see the
+// same store.
+extern volatile bool stop_normal_tx;
+
 #define MAX_SOCKET 8
 #define MAX_LCORE_PER_SOCKET 32
 

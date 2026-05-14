@@ -174,6 +174,15 @@ public:
     bool fetchFile(const std::string& remote_path, const std::string& local_path);
 
     /**
+     * @brief Fetch an entire remote directory to the local filesystem via scp -r
+     * @param remote_path Full remote directory path (e.g. /tmp/mmms_logs)
+     * @param local_path Local destination directory (created if missing).
+     *                   The contents of remote_path land directly inside this dir.
+     * @return true on success
+     */
+    bool fetchDirectory(const std::string& remote_path, const std::string& local_path);
+
+    /**
      * @brief Deploy, build, run application and fetch its log file
      * @param local_source_dir Local source directory
      * @param app_name Application name

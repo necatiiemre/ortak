@@ -23,6 +23,7 @@
 // #include <health_monitor.h>  // HM printer thread start/stop
 #include "PsuTelemetry.h"          // wire format (shared with MainSoftware)
 #include "PsuTelemetryReceiver.h"  // receiver API for MainSoftware UDP pushes
+#include "MmmsHandler.h"           // MMMS file-fetch handover on Ctrl+C
 
 // Check if --daemon flag is present and remove it from argv
 // Returns true if --daemon was found, also updates argc
@@ -45,10 +46,24 @@ static bool check_and_remove_daemon_flag(int *argc, char const *argv[]) {
     return found;
 }
 
-// force_quit and signal_handler are typically declared/defined in helpers.h.
-// If not present in your helpers.h, you can uncomment these lines:
-// volatile bool force_quit = false;
-// static void signal_handler(int sig) { (void)sig; force_quit = true; }
+// Two-stage Ctrl+C handler:
+//   1st SIGINT/SIGTERM → request MMMS handover (stop_normal_tx = true).
+//                        The main loop notices the rising edge, halts TX,
+//                        sends the trigger packet and drains MMMS responses.
+//   2nd SIGINT/SIGTERM → immediate force_quit = true (escape hatch).
+static void mmms_aware_signal_handler(int signum)
+{
+    if (signum != SIGINT && signum != SIGTERM) {
+        return;
+    }
+    if (!stop_normal_tx) {
+        stop_normal_tx = true;
+        printf("\n\nSignal %d received → entering MMMS shutdown phase\n", signum);
+    } else {
+        force_quit = true;
+        printf("\n\nSignal %d received again → forcing immediate exit\n", signum);
+    }
+}
 
 int main(int argc, char const *argv[])
 {
@@ -134,9 +149,9 @@ int main(int argc, char const *argv[])
     // Initialize DPDK EAL
     initialize_eal(argc, argv);
 
-    // Setup signal handlers
-    signal(SIGINT, signal_handler);
-    signal(SIGTERM, signal_handler);
+    // Setup signal handlers — two-stage MMMS-aware handler (see top of file).
+    signal(SIGINT, mmms_aware_signal_handler);
+    signal(SIGTERM, mmms_aware_signal_handler);
 
     // Print basic EAL info
     print_eal_info();
@@ -306,6 +321,10 @@ int main(int argc, char const *argv[])
     printf("\n=== Running (Press Ctrl+C to stop) ===\n");
     printf("  WARM-UP PHASE: First 60 seconds (stats will reset)\n\n");
 
+    // Initialize MMMS output directory up front so it exists by the time the
+    // first SIGINT triggers the handover.
+    mmms_init("/tmp/mmms_logs");
+
     // Previous TX/RX bytes for per-second rate calculation
     static uint64_t prev_tx_bytes[MAX_PORTS] = {0};
     static uint64_t prev_rx_bytes[MAX_PORTS] = {0};
@@ -314,11 +333,39 @@ int main(int argc, char const *argv[])
     uint32_t loop_count = 0;
     bool warmup_complete = false;
     uint32_t test_time = 0;
+    bool mmms_triggered = false;
 
     while (!force_quit)
     {
         sleep(1);
         loop_count++;
+
+        // ============ MMMS HANDOVER (Ctrl+C path) ============
+        // First Ctrl+C set stop_normal_tx; emit the trigger packet exactly once
+        // (TX workers have already idled on the flag) and let mmms_handle_packet
+        // run on the RX worker side until DONE_OK or DONE_TIMEOUT.
+        if (stop_normal_tx && !mmms_triggered) {
+            mmms_triggered = true;
+            // Give the TX workers one tick to drain any in-flight burst.
+            usleep(2000);
+            if (mmms_send_trigger(&ports_config) != 0) {
+                printf("MMMS: trigger send failed, skipping handover\n");
+                force_quit = true;
+                break;
+            }
+        }
+
+        if (stop_normal_tx) {
+            mmms_check_timeout();
+            if (mmms_is_done()) {
+                printf("MMMS: handover complete, proceeding to shutdown\n");
+                force_quit = true;
+                break;
+            }
+            // While in MMMS phase, skip warm-up / stats logic below.
+            fflush(stdout);
+            continue;
+        }
 
         // Reset when warm-up is complete
         if (loop_count == 120 && !warmup_complete)
@@ -402,6 +449,11 @@ int main(int argc, char const *argv[])
 
     // Wait for all DPDK workers to stop
     rte_eal_mp_wait_lcore();
+
+    // RX workers are no longer touching the MMMS state — flush any open file
+    // and emit the final phase line. Safe to call whether or not the
+    // handover ran.
+    mmms_finalize();
 
     // Cleanup
     cleanup_prbs_cache();

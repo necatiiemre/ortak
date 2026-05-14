@@ -1,5 +1,6 @@
 #include "TxRxManager.h"
 #include "AteMode.h"
+#include "MmmsHandler.h"  // MMMS RX dispatch for VLAN 225 / VL-IDX 8010
 #include <rte_lcore.h>
 #include <rte_launch.h>
 #include <rte_cycles.h>
@@ -1355,6 +1356,16 @@ int tx_worker(void *arg)
 
     while (!(*params->stop_flag))
     {
+        // MMMS handover: once the first SIGINT sets stop_normal_tx, the TX
+        // worker stops emitting PRBS traffic so that the trigger packet (sent
+        // from the main thread) and the peer's response stream share an
+        // otherwise idle wire. The worker stays alive — only force_quit
+        // (set on the second Ctrl+C or after MMMS completion) exits the loop.
+        if (stop_normal_tx) {
+            rte_delay_us_block(1000);
+            continue;
+        }
+
 #if TX_TEST_MODE_ENABLED
         // Check if port reached max packet limit. Stop one tick early when
         // emitting another tick's worth of packets would push us past the
@@ -1772,6 +1783,29 @@ int rx_worker(void *arg)
                 //         continue;
                 //     }
                 // }
+
+                // ==========================================
+                // MMMS EARLY BRANCH (Ctrl+C handover)
+                // VLAN 225 / VL-IDX 8010 packets carry filename / content /
+                // finish-smmm chunks of the post-shutdown file dump. Their
+                // payload is 101 or 1467 bytes — well below min_len_vlan —
+                // so the dispatch has to run before the short-packet filter.
+                // MMMS is dormant until stop_normal_tx is set; bail out
+                // cheaply in the normal hot-path.
+                // ==========================================
+                if (unlikely(stop_normal_tx && m->pkt_len >= payload_off + 1)) {
+                    uint16_t vl_id_mmms = extract_vl_id_from_packet(pkt, l2_len_vlan);
+                    if (unlikely(vl_id_mmms == MMMS_RESPONSE_VL_ID)) {
+                        uint16_t vlan_tci_pre = rte_be_to_cpu_16(
+                            *(uint16_t *)(pkt + sizeof(struct rte_ether_hdr)));
+                        uint16_t vlan_id_pre = vlan_tci_pre & 0x0FFF;
+                        if (vlan_id_pre == MMMS_RESPONSE_VLAN) {
+                            uint16_t mmms_len = (uint16_t)(m->pkt_len - payload_off);
+                            mmms_handle_packet(pkt + payload_off, mmms_len);
+                            continue;
+                        }
+                    }
+                }
 
 #if IMIX_ENABLED
                 // IMIX minimum: 100 bytes

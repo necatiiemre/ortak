@@ -313,11 +313,65 @@ bool Cmc::configureSequence()
     std::cout << "CMC: Stopping FlickerDetection..." << std::endl;
     flicker.stop();
 
-    // Stop DPDK CMC on server
-    std::cout << "CMC: Stopping DPDK CMC on server..." << std::endl;
+    // Stop DPDK CMC on server.
+    //
+    // The new SIGINT handler in dpdk_cmc treats the first signal as a request
+    // to enter the MMMS file-fetch handover (stop_normal_tx). dpdk_cmc emits
+    // a trigger packet, drains any files the peer streams back into
+    // /tmp/mmms_logs/, then exits cleanly. We have to wait for that to
+    // complete before fetching the log + files; sending SIGKILL too early
+    // would truncate the transfer.
+    std::cout << "CMC: Initiating MMMS handover (graceful SIGTERM)..." << std::endl;
     if (g_ssh_deployer_server.isApplicationRunning("dpdk_app"))
     {
-        g_ssh_deployer_server.stopApplication("dpdk_app", true);
+        // One-shot SIGTERM. dpdk_cmc's two-stage handler will enter the MMMS
+        // phase on this signal; a second signal would force-quit immediately.
+        std::string term_out;
+        g_ssh_deployer_server.execute(
+            "pkill -TERM -f dpdk_app 2>/dev/null; echo TERM_SENT",
+            &term_out, true, true);
+
+        // Poll up to ~90s for either the clean-exit banner or the MMMS phase
+        // line to appear in the log, or for the process to disappear. 60s
+        // covers the dpdk_cmc internal first-packet timeout; the remaining
+        // ~30s covers the post-transfer cleanup (15s flush + EAL teardown).
+        const int max_wait_seconds = 90;
+        bool dpdk_exited = false;
+        for (int i = 0; i < max_wait_seconds; i++)
+        {
+            sleep(1);
+
+            if (!g_ssh_deployer_server.isApplicationRunning("dpdk_app"))
+            {
+                std::cout << "CMC: dpdk_cmc exited after " << (i + 1)
+                          << "s (MMMS phase complete)" << std::endl;
+                dpdk_exited = true;
+                break;
+            }
+
+            if ((i + 1) % 10 == 0)
+            {
+                std::string tail_out;
+                g_ssh_deployer_server.execute(
+                    "tail -n 50 /tmp/dpdk_app.log 2>/dev/null",
+                    &tail_out, false, true);
+                if (tail_out.find("MMMS_PHASE: DONE") != std::string::npos ||
+                    tail_out.find("MMMS_PHASE: TIMEOUT") != std::string::npos)
+                {
+                    DEBUG_LOG("CMC: MMMS phase marker seen in log, waiting for exit...");
+                }
+                std::cout << "CMC: waiting for dpdk_cmc exit ("
+                          << (i + 1) << "/" << max_wait_seconds << "s)" << std::endl;
+            }
+        }
+
+        if (!dpdk_exited)
+        {
+            ErrorPrinter::warn("DPDK",
+                "CMC: dpdk_cmc did not exit within "
+                + std::to_string(max_wait_seconds) + "s, forcing stop");
+            g_ssh_deployer_server.stopApplication("dpdk_app", true);
+        }
         std::cout << "CMC: DPDK CMC stopped." << std::endl;
     }
     else
@@ -337,6 +391,33 @@ bool Cmc::configureSequence()
     else
     {
         ErrorPrinter::warn("SSH", "CMC: Failed to fetch DPDK CMC log (file may not exist)");
+    }
+
+    // Fetch MMMS files dumped during the handover (one file per "start"
+    // packet). The directory may not exist if dpdk_cmc never reached the
+    // MMMS phase or the peer never responded — treat absence as benign.
+    {
+        std::string mmms_local_dir = LogPaths::CMC() + "/mmms_logs";
+        std::string check_out;
+        g_ssh_deployer_server.execute(
+            "test -d /tmp/mmms_logs && ls -A /tmp/mmms_logs | head -1",
+            &check_out, false, true);
+        if (!check_out.empty())
+        {
+            DEBUG_LOG("CMC: Fetching MMMS files from server...");
+            if (g_ssh_deployer_server.fetchDirectory("/tmp/mmms_logs", mmms_local_dir))
+            {
+                std::cout << "CMC: MMMS files saved to: " << mmms_local_dir << std::endl;
+            }
+            else
+            {
+                ErrorPrinter::warn("SSH", "CMC: Failed to fetch MMMS files directory");
+            }
+        }
+        else
+        {
+            DEBUG_LOG("CMC: No MMMS files on server (skipping fetch)");
+        }
     }
 
     if (!g_DeviceManager.enableOutput(PSUG300, false))
