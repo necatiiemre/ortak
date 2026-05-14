@@ -498,6 +498,7 @@ static void *ptp_thread_fn(void *arg)
             if (ptp_tx_frame(f->dpdk_port, buf, sizeof(buf)) == 0) {
                 st->sync_tx++;
                 st->tx_seq++;
+                st->last_t1_ns           = t1;
                 st->last_sync_tx_mono_ns = mono;
             } else {
                 st->tx_fail++;
@@ -674,26 +675,50 @@ void ptp_stop(void)
     g_ptp_thread = 0;
 }
 
+/* Render a microsecond delta in the most readable unit (us → ms → s → h →
+ * d). Useful when one clock domain is hours/days off another (peer VMC
+ * uptime clock vs our ATE UTC). */
+static void fmt_dur_us(double us, char *out, size_t n)
+{
+    double a = us < 0 ? -us : us;
+    char sign = us < 0 ? '-' : '+';
+    if (a >= 86400.0 * 1e6)        snprintf(out, n, "%c%9.3f d ", sign, a / (86400.0 * 1e6));
+    else if (a >= 3600.0 * 1e6)    snprintf(out, n, "%c%9.3f h ", sign, a / (3600.0  * 1e6));
+    else if (a >= 1e6)             snprintf(out, n, "%c%9.3f s ", sign, a / 1e6);
+    else if (a >= 1e3)             snprintf(out, n, "%c%9.3f ms", sign, a / 1e3);
+    else                            snprintf(out, n, "%c%9.3f us", sign, a);
+}
+
+/* Format an absolute clock value (ns since Unix epoch) as
+ * "YYYY-MM-DDTHH:MM:SS.mmmZ" UTC. Returns "n/a" when ns == 0. */
+static void fmt_utc(uint64_t ns, char *out, size_t n)
+{
+    if (ns == 0) { snprintf(out, n, "n/a"); return; }
+    time_t   sec = (time_t)(ns / 1000000000ULL);
+    uint32_t rem = (uint32_t)(ns % 1000000000ULL);
+    struct tm tm;
+    gmtime_r(&sec, &tm);
+    char base[24];
+    strftime(base, sizeof(base), "%Y-%m-%dT%H:%M:%S", &tm);
+    snprintf(out, n, "%s.%03uZ", base, rem / 1000000);
+}
+
 void ptp_print_dashboard(void)
 {
-    printf("\n[PTP] role-aware 1588v2  (M1=Master, M2=Slave)\n");
-    printf("┌────┬──────┬────┬────┬──┬────────────────┬────────┬────────┬────────┬────────┬─────────┬────────────┬────────────┬────────────┬────────────┐\n");
-    printf("│ #  │ Lbl  │ Pt │Role│NE│ VL-IDs S/Rq/Rs │ Sync   │ ReqRx  │ RspTx  │ ReqTx  │ RspRx/TO│ T2-T1 (us) │ T4-T3 (us) │ offset(us) │ delay (us) │\n");
-    printf("├────┼──────┼────┼────┼──┼────────────────┼────────┼────────┼────────┼────────┼─────────┼────────────┼────────────┼────────────┼────────────┤\n");
+    char ts_now[32];
+    fmt_utc(now_real_ns(), ts_now, sizeof(ts_now));
+    printf("\n[PTP] role-aware  (M1 = WE send Sync, peer is Slave;  "
+           "M2 = peer sends Sync, WE are Slave)\n");
+    printf("[PTP] local clock (ATE) = %s\n", ts_now);
+
+    printf("┌────┬──────┬────┬────┬──┬────────────────┬─────────┬─────────┬─────────┬─────────┬─────────┬──────────────┬──────────────┬──────────────┬──────────────┐\n");
+    printf("│ #  │ Lbl  │ Pt │Role│NE│ VL-IDs S/Rq/Rs │  Sync   │  ReqRx  │  RspTx  │  ReqTx  │ RspRx/TO│   T2 - T1    │   T4 - T3    │   offset     │    delay     │\n");
+    printf("├────┼──────┼────┼────┼──┼────────────────┼─────────┼─────────┼─────────┼─────────┼─────────┼──────────────┼──────────────┼──────────────┼──────────────┤\n");
     for (int i = 0; i < PTP_NUM_FLOWS; i++) {
         const struct ptp_flow *f = &ptp_flows[i];
         const struct ptp_state *s = &g_state[i];
-        /* Role tag is always "M<n>" — M1=Master, M2=Slave. */
-        char ne_c   = (f->ne == PTP_NE_A) ? 'A' : 'B';
+        char ne_c = (f->ne == PTP_NE_A) ? 'A' : 'B';
 
-        /* Δ_sync = T2 - T1   (master → us)
-         * Δ_req  = T4 - T3   (us → master, or M1's RX of Unit's Delay_Req)
-         * offset = ((T2-T1) - (T4-T3)) / 2    (E2E PTP slave; cancels clock skew)
-         * delay  = ((T2-T1) + (T4-T3)) / 2    (mean path delay; clock-skew-free)
-         *
-         * For M1 (Master), the two legs are measured against DIFFERENT peers
-         * (Sync from ATE, Delay_Req from Unit), so offset/delay are mixed-peer
-         * curiosities; we still print them for cross-check. */
         double dt_sync = 0.0, dt_req = 0.0, offs = 0.0, delay = 0.0;
         bool have_sync = (s->last_t1_ns && s->last_t2_ns);
         bool have_req  = (s->last_t3_ns && s->last_t4_ns);
@@ -710,34 +735,32 @@ void ptp_print_dashboard(void)
         if (f->role == PTP_ROLE_M1_MASTER) {
             snprintf(req_rx_s,  sizeof(req_rx_s),  "%lu", (unsigned long)s->req_rx);
             snprintf(resp_tx_s, sizeof(resp_tx_s), "%lu", (unsigned long)s->resp_tx);
-            snprintf(req_tx_s,  sizeof(req_tx_s),  "%s", "-");
-            snprintf(resp_rx_s, sizeof(resp_rx_s), "%s", "-");
+            snprintf(req_tx_s,  sizeof(req_tx_s),  "-");
+            snprintf(resp_rx_s, sizeof(resp_rx_s), "-");
         } else {
-            snprintf(req_rx_s,  sizeof(req_rx_s),  "%s", "-");
-            snprintf(resp_tx_s, sizeof(resp_tx_s), "%s", "-");
+            snprintf(req_rx_s,  sizeof(req_rx_s),  "-");
+            snprintf(resp_tx_s, sizeof(resp_tx_s), "-");
             snprintf(req_tx_s,  sizeof(req_tx_s),  "%lu", (unsigned long)s->req_tx);
             snprintf(resp_rx_s, sizeof(resp_rx_s), "%lu/%lu",
                      (unsigned long)s->resp_rx, (unsigned long)s->resp_timeout);
         }
 
         char dt_sync_s[16], dt_req_s[16], offs_s[16], delay_s[16];
-        if (have_sync) snprintf(dt_sync_s, sizeof(dt_sync_s), "%+10.3f", dt_sync);
-        else           snprintf(dt_sync_s, sizeof(dt_sync_s), "%10s", "-");
-        if (have_req)  snprintf(dt_req_s,  sizeof(dt_req_s),  "%+10.3f", dt_req);
-        else           snprintf(dt_req_s,  sizeof(dt_req_s),  "%10s", "-");
+        if (have_sync) fmt_dur_us(dt_sync, dt_sync_s, sizeof(dt_sync_s));
+        else           snprintf(dt_sync_s, sizeof(dt_sync_s), "%12s", "-");
+        if (have_req)  fmt_dur_us(dt_req,  dt_req_s,  sizeof(dt_req_s));
+        else           snprintf(dt_req_s,  sizeof(dt_req_s),  "%12s", "-");
         if (have_sync && have_req) {
-            snprintf(offs_s,  sizeof(offs_s),  "%+10.3f", offs);
-            snprintf(delay_s, sizeof(delay_s), "%+10.3f", delay);
+            fmt_dur_us(offs,  offs_s,  sizeof(offs_s));
+            fmt_dur_us(delay, delay_s, sizeof(delay_s));
         } else {
-            snprintf(offs_s,  sizeof(offs_s),  "%10s", "-");
-            snprintf(delay_s, sizeof(delay_s), "%10s", "-");
+            snprintf(offs_s,  sizeof(offs_s),  "%12s", "-");
+            snprintf(delay_s, sizeof(delay_s), "%12s", "-");
         }
 
-        /* SyncRx column shows TX count for M1 (master emits Sync), RX count
-         * for M2 (slave receives Sync). */
         uint64_t sync_count = (f->role == PTP_ROLE_M1_MASTER) ? s->sync_tx
                                                               : s->sync_rx;
-        printf("│ %2d │ %-4s │ %2u │ M%c │%c │ %5u/%4u/%4u │ %6lu │ %6s │ %6s │ %6s │ %7s │ %s │ %s │ %s │ %s │\n",
+        printf("│ %2d │ %-4s │ %2u │ M%c │%c │ %5u/%4u/%4u │ %7lu │ %7s │ %7s │ %7s │ %7s │ %12s │ %12s │ %12s │ %12s │\n",
                i, f->j_label, (unsigned)f->dpdk_port,
                (f->role == PTP_ROLE_M1_MASTER) ? '1' : '2',
                ne_c,
@@ -747,7 +770,52 @@ void ptp_print_dashboard(void)
                req_tx_s, resp_rx_s,
                dt_sync_s, dt_req_s, offs_s, delay_s);
     }
-    printf("└────┴──────┴────┴────┴──┴────────────────┴────────┴────────┴────────┴────────┴─────────┴────────────┴────────────┴────────────┴────────────┘\n");
+    printf("└────┴──────┴────┴────┴──┴────────────────┴─────────┴─────────┴─────────┴─────────┴─────────┴──────────────┴──────────────┴──────────────┴──────────────┘\n");
+
+    /* Per-flow Clock state — UTC strings let humans see at a glance which
+     * side's clock is off and by how much. */
+    printf("\n[PTP] Clock state per flow (T1..T4 = last observed timestamps, UTC):\n");
+    for (int i = 0; i < PTP_NUM_FLOWS; i++) {
+        const struct ptp_flow *f = &ptp_flows[i];
+        const struct ptp_state *s = &g_state[i];
+        char ne_c = (f->ne == PTP_NE_A) ? 'A' : 'B';
+        char t1[32], t2[32], t3[32], t4[32];
+        fmt_utc(s->last_t1_ns, t1, sizeof(t1));
+        fmt_utc(s->last_t2_ns, t2, sizeof(t2));
+        fmt_utc(s->last_t3_ns, t3, sizeof(t3));
+        fmt_utc(s->last_t4_ns, t4, sizeof(t4));
+
+        if (f->role == PTP_ROLE_M1_MASTER) {
+            printf("  [%d] M1 %s NE_%c — WE are Master, peer VMC is Slave\n",
+                   i, f->j_label, ne_c);
+            printf("        T1 we sent  (Sync):       %s\n", t1);
+            printf("        T3 peer sent (Delay_Req): %s\n", t3);
+            printf("        T4 we received:           %s\n", t4);
+            if (s->last_t3_ns && s->last_t4_ns) {
+                char d[32];
+                double dus = ((double)s->last_t4_ns - (double)s->last_t3_ns) / 1000.0;
+                fmt_dur_us(dus, d, sizeof(d));
+                printf("        T4 - T3 = %s   → peer VMC clock vs our ATE clock\n", d);
+            }
+        } else {
+            printf("  [%d] M2 %s NE_%c — peer VMC is Master, WE are Slave (read-only)\n",
+                   i, f->j_label, ne_c);
+            printf("        T1 peer sent  (Sync):       %s\n", t1);
+            printf("        T2 we received:             %s\n", t2);
+            printf("        T3 we sent    (Delay_Req):  %s\n", t3);
+            printf("        T4 peer's RX (echoed):      %s\n", t4);
+            if (s->last_t1_ns && s->last_t2_ns &&
+                s->last_t3_ns && s->last_t4_ns) {
+                char o[32], d[32];
+                double dts  = ((double)s->last_t2_ns - (double)s->last_t1_ns) / 1000.0;
+                double dtr  = ((double)s->last_t4_ns - (double)s->last_t3_ns) / 1000.0;
+                fmt_dur_us((dts - dtr) / 2.0, o, sizeof(o));
+                fmt_dur_us((dts + dtr) / 2.0, d, sizeof(d));
+                printf("        offset = %s   path delay = %s\n", o, d);
+                printf("        (clock disciplining is OFF — local clock NOT adjusted)\n");
+            }
+        }
+    }
 
     /* Bad counters + stale flags */
     uint64_t bv=0, bn=0, bs=0, bt=0, af=0, tf=0;
@@ -764,7 +832,7 @@ void ptp_print_dashboard(void)
             else stale_b = 1;
         }
     }
-    printf("[PTP] bad vlan=%lu ne=%lu size=%lu type=%lu | alloc_fail=%lu tx_fail=%lu | stale: A=%s B=%s\n",
+    printf("\n[PTP] bad vlan=%lu ne=%lu size=%lu type=%lu | alloc_fail=%lu tx_fail=%lu | stale: A=%s B=%s\n",
            (unsigned long)bv, (unsigned long)bn, (unsigned long)bs,
            (unsigned long)bt, (unsigned long)af, (unsigned long)tf,
            stale_a ? "yes" : "no", stale_b ? "yes" : "no");
